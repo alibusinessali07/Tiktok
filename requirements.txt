@@ -1,0 +1,13 @@
+# TikTok Scraper Requirements
+# Install with: pip install -r requirements.txt
+
+# Main TikTok Scraper (tiktok.py)
+playwright>=1.45.0
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+pytz>=2023.3
+
+# Daily Scheduler (daily_scheduler.py)
+schedule>=1.2.0
+requests>=2.31.0
+gdown>=4.7.1
