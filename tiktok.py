@@ -84,7 +84,7 @@ COMBINED_DB_SPREADSHEET_ID = "1VIll8-H7_j3BwknGKwiPRFW0LMIeKcIMV6bZrx2UZ14"
 
 if TEST_MODE:
     SPREADSHEET_ID = "1L7r3rWl0JLVJVypSPML7Y0cvkulYi5LKBOTP7bER9AI"
-    COMBINED_DB_SPREADSHEET_ID = "1t21VCweRezB0MkgzXimqBKLh7mI6Ri4tEsljFG9dmcA"
+    COMBINED_DB_SPREADSHEET_ID = "1mD3-YFe6x7d21yx-I8asCsgkrczvvUbd0konE_fJizo"
 PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
 BUFFER_PROFILE_URL = os.getenv("BUFFER_PROFILE_URL", "https://www.tiktok.com/@tiktok")
 
@@ -408,31 +408,12 @@ def log_and_print(message: str, level: str = "INFO") -> None:
             _logger.info(message)
 
 
-def now_utc_ts() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def isoformat_utc(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def within_last_days(ts: int, days: int) -> bool:
-    cutoff = now_utc_ts() - days * 86400
-    return ts >= cutoff
-
-
 def extract_username_from_profile_url(url: str) -> Optional[str]:
     # Avoid character class ranges; keep '-' at the end
     m = re.search(r"tiktok\.com/(@[\w._-]+)", url)
     if m:
         return m.group(1).lstrip("@")
     return None
-
-
-def sanitize_filename_component(text: str) -> str:
-    """Return a safe component for filenames (alnum, dash, underscore)."""
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
-    return safe.strip("_") or "tiktok"
 
 
 # ============================================================================
@@ -579,22 +560,6 @@ def sheets_update_values(service, spreadsheet_id: str, range_name: str, values: 
         make_request,
         max_retries=3,
         operation_name=f"update values in {range_name}"
-    )
-
-
-def sheets_batch_get_values(service, spreadsheet_id: str, ranges: List[str], value_render_option: str = 'FORMATTED_VALUE'):
-    """Rate-limited wrapper for spreadsheets().values().batchGet()."""
-    def make_request():
-        return service.spreadsheets().values().batchGet(
-            spreadsheetId=spreadsheet_id,
-            ranges=ranges,
-            valueRenderOption=value_render_option
-        ).execute()
-
-    return _read_rate_limiter.execute_with_retry(
-        make_request,
-        max_retries=3,
-        operation_name=f"batch get values ({len(ranges)} ranges)"
     )
 
 
@@ -977,7 +942,10 @@ def normalize_profile_link(link: str) -> str:
     """Normalize LINK cell for stable keying without changing navigation URL semantics."""
     if not link:
         return ""
-    return str(link).strip().strip("\"'").strip()
+    s = str(link)
+    s = re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]", "", s)
+    s = s.replace("\u00A0", " ")
+    return s.strip().strip("\"'").strip()
 
 
 def normalize_username(raw_username: str) -> Optional[str]:
@@ -1016,7 +984,7 @@ def normalize_profile_url(raw: str) -> Optional[str]:
     if not path:
         return None
     segments = [s for s in path.split("/") if s]
-    if len(segments) != 1:
+    if not segments:
         return None
     first = segments[0]
     if not first.startswith("@"):
@@ -1025,6 +993,14 @@ def normalize_profile_url(raw: str) -> Optional[str]:
     if not username:
         return None
     if not re.fullmatch(r"[\w\.-]+", username):
+        return None
+    if len(segments) == 1:
+        pass
+    elif len(segments) == 2 and segments[1] == "likes":
+        pass
+    elif len(segments) >= 3 and segments[1] in {"video", "photo"}:
+        pass
+    else:
         return None
     return f"https://www.tiktok.com/@{username}"
 
@@ -1804,12 +1780,21 @@ def rebuild_manager_sheet_tabs(service, spreadsheet_id: str, manager_label: str 
         data_rows = values[HEADER_ROW:] if len(values) >= HEADER_ROW else []
         for row in data_rows:
             padded = _pad_row_to_width(row, width)
-            if not _row_has_any_content(padded):
+            username_cell = padded[COLUMNS['USERNAME']] if len(padded) > COLUMNS['USERNAME'] else ""
+            link_cell = padded[COLUMNS['LINK']] if len(padded) > COLUMNS['LINK'] else ""
+            username_ok = bool(normalize_username(username_cell))
+            link_norm = normalize_profile_link(link_cell)
+            link_ok = bool(link_norm) and str(link_norm).upper() not in ['NA', 'N/A', 'NULL', 'EMPTY'] and str(link_norm).lower() != 'tiktok'
+            if not (username_ok or link_ok):
                 continue
             canonical_link = normalize_profile_url(padded[COLUMNS['LINK']] if len(padded) > COLUMNS['LINK'] else "")
+            canonical_username = canonical_username_from_row(padded)
             if canonical_link:
                 padded[COLUMNS['LINK']] = canonical_link
-            canonical_username = canonical_username_from_row(padded)
+            elif canonical_username:
+                padded[COLUMNS['LINK']] = f"https://www.tiktok.com/@{canonical_username}"
+            else:
+                continue
             if canonical_username and not normalize_username(padded[COLUMNS['USERNAME']] if len(padded) > COLUMNS['USERNAME'] else ""):
                 padded[COLUMNS['USERNAME']] = f"@{canonical_username}"
             all_rows_by_tab[tab_name].append(padded)
@@ -1830,29 +1815,29 @@ def rebuild_manager_sheet_tabs(service, spreadsheet_id: str, manager_label: str 
         read_counts.get(TAB_NAMES['RELIABLE'], 0),
     )
 
-    best_row_by_username: Dict[str, Tuple[int, str, List[Any], int]] = {}
+    best_row_by_url: Dict[str, Tuple[int, str, List[Any], int]] = {}
     duplicate_drops = 0
     for tab_name in tabs_to_process:
         for row_idx, row in enumerate(all_rows_by_tab.get(tab_name, [])):
-            uname = canonical_username_from_row(row)
-            if not uname:
+            canonical_url = row[COLUMNS['LINK']] if len(row) > COLUMNS['LINK'] else ""
+            if not canonical_url:
                 continue
             candidate = (priority_rank.get(tab_name, 99), tab_name, row, row_idx)
-            existing = best_row_by_username.get(uname)
+            existing = best_row_by_url.get(canonical_url)
             if existing is None or candidate[0] < existing[0]:
                 if existing is not None:
                     duplicate_drops += 1
-                best_row_by_username[uname] = candidate
+                best_row_by_url[canonical_url] = candidate
             elif existing is not None:
                 duplicate_drops += 1
 
     rebuilt_rows_by_tab: Dict[str, List[List[Any]]] = {tab: [] for tab in tabs_to_process}
-    for uname, (_rank, tab_name, row, _orig_idx) in best_row_by_username.items():
+    for _canonical_url, (_rank, tab_name, row, _orig_idx) in best_row_by_url.items():
         rebuilt_rows_by_tab.setdefault(tab_name, []).append(row)
 
     _logger.info(
-        "[sheet-rebuild] deduped unique usernames: %s (dropped duplicates: %s)",
-        len(best_row_by_username),
+        "[sheet-rebuild] deduped unique urls: %s (dropped duplicates: %s)",
+        len(best_row_by_url),
         duplicate_drops,
     )
 
@@ -1964,17 +1949,21 @@ def read_entire_sheet() -> Dict[str, Any]:
                 
                 username_raw = row[COLUMNS['USERNAME']] if len(row) > COLUMNS['USERNAME'] and row[COLUMNS['USERNAME']] else ""
                 link_raw = row[COLUMNS['LINK']] if len(row) > COLUMNS['LINK'] and row[COLUMNS['LINK']] else ""
+                username_normalized = canonical_username_from_row(row)
+                if not username_normalized:
+                    continue
+
                 raw_link = normalize_profile_link(str(link_raw or ""))
                 canon_link = normalize_profile_url(raw_link)
                 if canon_link is not None:
                     log_and_print(f"[url][canon] raw={raw_link} -> canon={canon_link}")
                     link = canon_link
                 else:
-                    log_and_print(f"[url][invalid] raw={raw_link}")
-                    link = raw_link
-                username_normalized = canonical_username_from_row(row)
-                if not username_normalized:
-                    continue
+                    fallback = f"https://www.tiktok.com/@{username_normalized}"
+                    log_and_print(f"[url][fallback] raw={raw_link} -> fallback={fallback}")
+                    queue_sheet_value_update(spreadsheet_id, f"{tab_name}!B{i}", [[fallback]], value_input_option='USER_ENTERED')
+                    canon_link = fallback
+                    link = canon_link
                 if not link or str(link).upper() in ['NA', 'N/A', 'NULL', 'EMPTY'] or str(link).lower() == 'tiktok':
                     continue
 
@@ -2077,7 +2066,7 @@ def write_na_to_sheet(username: str, profile_url: str = "") -> bool:
     """Queue NA values for failed/empty profiles using cached username lookup."""
     try:
         spreadsheet_id = SPREADSHEET_ID
-        username_normalized = username.lower().lstrip('@')
+        username_normalized = normalize_username(username)
         profile_url = normalize_profile_url(profile_url) or normalize_profile_link(profile_url)
         if not username_normalized or not profile_url:
             _logger.warning(f"Skipping NA write: missing username/link ({username}, {profile_url})")
@@ -2154,15 +2143,15 @@ def write_analytics_to_sheet(analytics_data: Dict[str, Any]) -> bool:
     """Queue analytics write using cached username mapping and previous median cache."""
     try:
         spreadsheet_id = SPREADSHEET_ID
-        username = analytics_data.get('username', '').lstrip('@')
-        username_normalized = username.lower().lstrip('@')
+        username_raw = analytics_data.get('username', '') or ''
+        username_normalized = normalize_username(username_raw)
         profile_url = normalize_profile_url(str(analytics_data.get("profile_url") or "")) or normalize_profile_link(str(analytics_data.get("profile_url") or ""))
         if not username_normalized or not profile_url:
-            _logger.warning(f"   Skipping analytics write: missing username/link (@{username}, {profile_url})")
+            _logger.warning(f"   Skipping analytics write: missing username/link (@{username_raw}, {profile_url})")
             return False
         location = _resolve_profile_location(username_normalized, profile_url)
         if not location:
-            _logger.error(f"   ERROR: Username @{username} not found in any enabled tab - skipping")
+            _logger.error(f"   ERROR: Username @{username_raw} not found in any enabled tab - skipping")
             return False
         found_tab, row_number = location
         previous_median_views = _current_sheet_data.get('username_to_prev_median', {}).get(username_normalized)
@@ -2206,7 +2195,7 @@ def write_analytics_to_sheet(analytics_data: Dict[str, Any]) -> bool:
             if profile_url:
                 _current_sheet_data.setdefault('link_to_prev_median', {})[normalize_link_key(profile_url)] = int(median_views)
         
-        _logger.info(f"Successfully updated analytics for @{username} in tab '{found_tab}' (row {row_number})")
+        _logger.info(f"Successfully updated analytics for @{username_normalized} in tab '{found_tab}' (row {row_number})")
         if LOG_LEVEL == "DEBUG":
             _logger.info(f"   Median views: {median_views:,}")
             if change_in_median != "NA":
@@ -3356,7 +3345,7 @@ def run_scraping_job(page, manager_label: str = ""):
         for i, profile_entry in enumerate(scraping_pbar, 1):
             if isinstance(profile_entry, dict):
                 url = str(profile_entry.get("profile_url") or "")
-                username_normalized = str(profile_entry.get("username_normalized") or "").lower().lstrip("@")
+                username_normalized = (normalize_username(profile_entry.get("username") or profile_entry.get("username_normalized") or "") or "")
                 username = str(profile_entry.get("username") or username_normalized or extract_username_from_profile_url(url) or "unknown")
             else:
                 # Backward-compatible fallback
@@ -3435,7 +3424,7 @@ def run_scraping_job(page, manager_label: str = ""):
                     _logger.error(f"   This will trigger a retry if profile exists in sheets with previous median views")
                     
                     # Check if profile exists in sheets and has previous median views
-                    username_normalized = username.lower().lstrip('@')
+                    username_normalized = normalize_username(username)
                     previous_median_views = sheet_data.get('username_to_prev_median', {}).get(username_normalized)
                     if previous_median_views is None:
                         previous_median_views = sheet_data.get('link_to_prev_median', {}).get(normalize_link_key(url))
@@ -3505,7 +3494,7 @@ def run_scraping_job(page, manager_label: str = ""):
                 # Calculate analytics for this profile and write to Google Sheets
                 try:
                     profile_stats = calculate_profile_stats(items)
-                    username_normalized = username.lower().lstrip('@')
+                    username_normalized = normalize_username(username)
                     previous_median_views = sheet_data.get('username_to_prev_median', {}).get(username_normalized)
                     if previous_median_views is None:
                         previous_median_views = sheet_data.get('link_to_prev_median', {}).get(normalize_link_key(url))
@@ -3677,11 +3666,11 @@ def run_scraping_job(page, manager_label: str = ""):
             
             for na_entry in na_pbar:
                 if isinstance(na_entry, dict):
-                    username_normalized = str(na_entry.get("username_normalized") or "").lower().lstrip("@")
+                    username_normalized = (normalize_username(na_entry.get("username") or na_entry.get("username_normalized") or "") or "")
                     username_display = str(na_entry.get("username") or username_normalized or "unknown")
                     profile_url = str(na_entry.get("profile_url") or "")
                 else:
-                    username_normalized = str(na_entry).lower().lstrip("@")
+                    username_normalized = (normalize_username(str(na_entry)) or "")
                     username_display = username_normalized or "unknown"
                     profile_url = ""
 
@@ -3793,6 +3782,7 @@ def run_scraping_job(page, manager_label: str = ""):
                 log_and_print(f"      100k+ views: {stats['videos_100k_plus']} videos")
                 log_and_print(f"   Total videos processed: {stats['total_videos']}")
         
+        flush_pending_sheet_writes("pre_scraping_completed")
         log_and_print("=" * 80)
         log_and_print("SCRAPING COMPLETED")
         if consecutive_failures >= max_consecutive_failures:
@@ -3928,33 +3918,28 @@ def apply_cost_formula_to_tabs(spreadsheet_id, tabs_to_process):
                 if len(values) <= HEADER_ROW:  # Only headers, no data
                     continue
                 
-                # Prepare formulas for all data rows (starting from row 3)
-                formulas = []
-                data_row_count = 0
+                # Build full-length column I values so row positions stay aligned (empty rows get blank)
+                col_i_values = []
                 for i, row in enumerate(values[HEADER_ROW:], start=DATA_START_ROW):
-                    # Skip if USERNAME or Link is empty
                     username = row[COLUMNS['USERNAME']].strip() if len(row) > COLUMNS['USERNAME'] and row[COLUMNS['USERNAME']] else ""
                     link = row[COLUMNS['LINK']].strip() if len(row) > COLUMNS['LINK'] and row[COLUMNS['LINK']] else ""
-                    
                     if not username and not link:
-                        continue
-                    
-                    # Add formula: =(100000*G{row})/J{row}
-                    formula = f"=(100000*G{i})/J{i}"
-                    formulas.append([formula])
-                    data_row_count += 1
+                        col_i_values.append([""])
+                    else:
+                        col_i_values.append([f"=(100000*G{i})/J{i}"])
                 
-                if formulas:
-                    # Write formulas to column I (Cost for 100k Views)
-                    formula_range = f"{tab_name}!I{DATA_START_ROW}:I{DATA_START_ROW + data_row_count - 1}"
+                if col_i_values:
+                    last_row = DATA_START_ROW + len(col_i_values) - 1
+                    formula_range = f"{tab_name}!I{DATA_START_ROW}:I{last_row}"
                     sheets_update_values(
                         service,
                         spreadsheet_id,
                         formula_range,
-                        formulas,
+                        col_i_values,
                         value_input_option='USER_ENTERED'
                     )
-                    log_and_print(f"  Applied formula to {data_row_count} rows in '{tab_name}'")
+                    non_empty_count = sum(1 for v in col_i_values if v[0])
+                    log_and_print(f"  Applied formula to {non_empty_count} rows in '{tab_name}' (range I{DATA_START_ROW}:I{last_row})")
                 
             except Exception as e:
                 log_and_print(f"  WARNING: Could not apply formula to '{tab_name}': {e}", "WARNING")

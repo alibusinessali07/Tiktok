@@ -1,4 +1,4 @@
-!pip install gspread google-api-python-client google-auth gspread-formatting pandas
+# !pip install gspread google-api-python-client google-auth gspread-formatting pandas
 
 """
 Weekly sheet reader for Deepnote.
@@ -14,6 +14,7 @@ import traceback
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -159,32 +160,113 @@ HEADER_ROW = 1   # 1-based: row 1 = headers
 DATA_START_ROW = 2   # 1-based: data starts here
 
 
-def _normalize_tiktok_link(url_or_profile: str) -> Optional[str]:
-    """
-    Normalize TikTok URL or @username to a canonical form for comparison.
-    Returns lowercase username without @, or None if invalid.
-    """
-    if not url_or_profile or not str(url_or_profile).strip():
+# =============================================================================
+# CANONICAL TIKTOK NORMALIZATION (from tiktok.py - do NOT reinterpret)
+# =============================================================================
+
+def normalize_profile_link(link: str) -> str:
+    """Normalize LINK cell for stable keying without changing navigation URL semantics."""
+    if not link:
+        return ""
+    s = str(link)
+    s = re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]", "", s)
+    s = s.replace("\u00A0", " ")
+    return s.strip().strip("\"'").strip()
+
+
+def normalize_username(raw_username: str) -> Optional[str]:
+    """Normalize username to lowercase without leading @."""
+    if raw_username is None:
         return None
-    s = str(url_or_profile).strip().strip('"\'')
-    # Extract username from URL
-    m = re.search(r"tiktok\.com/(@?[\w._-]+)", s, re.IGNORECASE)
-    if m:
-        username = m.group(1).lstrip("@")
-        return username.lower() if username else None
-    # Plain @username
-    if s.startswith("@"):
-        return s[1:].lower()
-    # Plain username
-    if "/" not in s and not s.startswith("http"):
-        return s.lower()
-    return None
+    uname = str(raw_username).strip().strip("\"'").strip().lower().lstrip("@")
+    return uname or None
 
 
-def _extract_tiktok_username(value: Any) -> str:
-    """Extract normalized TikTok username (no @, no URL). Returns \"\" if empty/invalid."""
-    n = _normalize_tiktok_link(str(value).strip() if value is not None else "")
-    return n or ""
+def normalize_profile_url(raw: str) -> Optional[str]:
+    """
+    Canonicalize TikTok profile URL to https://www.tiktok.com/@username.
+    Returns None when input is not a valid profile URL.
+    """
+    raw_norm = normalize_profile_link(raw)
+    if not raw_norm:
+        return None
+    candidate = raw_norm
+    if "://" not in candidate:
+        candidate = f"https://{candidate.lstrip('/')}"
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower().strip()
+    if host.startswith("www."):
+        bare_host = host[4:]
+    else:
+        bare_host = host
+    if not (bare_host == "tiktok.com" or bare_host.endswith(".tiktok.com")):
+        return None
+    if bare_host == "vt.tiktok.com":
+        return None
+    path = (parsed.path or "").strip()
+    if not path:
+        return None
+    segments = [s for s in path.split("/") if s]
+    if len(segments) != 1:
+        return None
+    first = segments[0]
+    if not first.startswith("@"):
+        return None
+    username = first[1:]
+    if not username:
+        return None
+    if not re.fullmatch(r"[\w\.-]+", username):
+        return None
+    return f"https://www.tiktok.com/@{username}"
+
+
+def _username_from_canonical_profile_url(url: str) -> Optional[str]:
+    """Extract normalized username from canonical profile URL."""
+    canon = normalize_profile_url(url)
+    if not canon:
+        return None
+    parsed = urlparse(canon)
+    segment = (parsed.path or "").strip("/").lstrip("@")
+    return normalize_username(segment)
+
+
+def normalize_link_key(link: str) -> str:
+    """Case-insensitive key for link-based row mapping."""
+    canonical = normalize_profile_url(link)
+    if canonical:
+        return canonical.lower()
+    return normalize_profile_link(link).lower()
+
+
+def canonical_tiktok_identity(
+    username_cell: Any, profile_cell: Any
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    Returns (username_norm, link_key, canonical_profile_url)
+    - username_norm: normalized username (lower, no @) using normalize_username,
+      OR fallback extracted from canonical_profile_url
+    - canonical_profile_url: normalize_profile_url(profile_cell) if valid else None
+    - link_key: normalize_link_key(profile_cell) ALWAYS (even if url invalid/empty)
+      for stable matching
+    """
+    profile_str = str(profile_cell or "").strip() if profile_cell is not None else ""
+    username_str = str(username_cell or "").strip() if username_cell is not None else ""
+
+    canonical_profile_url = normalize_profile_url(profile_str)
+    link_key = normalize_link_key(profile_str)
+
+    username_norm = normalize_username(username_str)
+    if not username_norm and canonical_profile_url:
+        username_norm = _username_from_canonical_profile_url(canonical_profile_url)
+    if not username_norm and profile_str:
+        username_norm = _username_from_canonical_profile_url(profile_str)
+    if not username_norm and profile_str:
+        username_norm = normalize_username(profile_str)
+
+    return (username_norm, link_key, canonical_profile_url)
 
 
 def _split_trailing_number(u: str) -> Tuple[str, str]:
@@ -207,8 +289,8 @@ def _canonicalize_incremented_profile(
     and the Name username appears elsewhere in the sheet, return the canonical username (Name).
     Otherwise return None (no change).
     """
-    name_u = _extract_tiktok_username(name_cell)
-    prof_u = _extract_tiktok_username(profile_cell)
+    name_u = normalize_username(name_cell) or canonical_tiktok_identity(name_cell, name_cell)[0]
+    prof_u = canonical_tiktok_identity(None, profile_cell)[0]
     if not name_u or not prof_u:
         return None
     if prof_u == name_u:
@@ -575,11 +657,11 @@ def load_sheet_data(
             value = row[idx] if idx < len(row) else ""
             record[col_name] = value if value is not None else ""
         raw_records.append(record)
-        u = _extract_tiktok_username(record.get("Name", ""))
+        u = normalize_username(record.get("Name", ""))
         if u:
             seen_usernames.add(u)
         for profile in _split_tiktok_profiles(record.get("TikTok Profile", "")):
-            u = _extract_tiktok_username(profile)
+            u = canonical_tiktok_identity(None, profile)[0]
             if u:
                 seen_usernames.add(u)
 
@@ -832,9 +914,9 @@ def _load_manager_sheet_links(
             if row_num < SOURCE_SHEET_DATA_START_ROW:
                 continue
             link = (row[0] or "").strip() if row else ""
-            norm = _normalize_tiktok_link(link)
-            if norm:
-                result[norm] = (tab_name, row_num)
+            canon = normalize_profile_url(link)
+            if canon:
+                result[normalize_link_key(link)] = (tab_name, row_num)
     return result
 
 
@@ -986,14 +1068,19 @@ def sync_payments_to_manager_sheets(
                 continue
 
             profile = str(pay_row.get("TikTok Profile") or "").strip()
-            norm = _normalize_tiktok_link(profile)
-            if not norm:
+            username_norm, link_key, canonical_url = canonical_tiktok_identity(None, profile)
+            if not username_norm and not canonical_url:
                 cat_stats["skipped_invalid"] += 1
                 run_stats["total_skipped_invalid"] += 1
                 print(f"    [SKIP Invalid] Profile: {profile[:50]}")
                 continue
 
-            info = link_map.get(norm)
+            match_key = (
+                normalize_link_key(canonical_url)
+                if canonical_url
+                else normalize_link_key("https://www.tiktok.com/@" + (username_norm or ""))
+            )
+            info = link_map.get(match_key)
 
             if info:
                 tab_name, row_num = info
@@ -1009,10 +1096,10 @@ def sync_payments_to_manager_sheets(
                     ):
                         cat_stats["updated"] += 1
                         run_stats["total_updated"] += 1
-                        print(f"    [UPDATED] @{norm} in Reliable row {row_num}")
+                        print(f"    [UPDATED] @{username_norm} in Reliable row {row_num}")
                     else:
                         run_stats["total_api_failures"] += 1
-                        print(f"    [FAILED] Could not update @{norm} (rate limit or API error)")
+                        print(f"    [FAILED] Could not update @{username_norm} (rate limit or API error)")
                     continue
                 first_empty = _get_first_empty_row_in_tab(service, sheet_id, reliable_tab)
                 existing = _read_row(service, sheet_id, tab_name, row_num)
@@ -1025,13 +1112,13 @@ def sync_payments_to_manager_sheets(
                     [new_row],
                 ):
                     run_stats["total_api_failures"] += 1
-                    print(f"    [FAILED] Could not move @{norm} to Reliable")
+                    print(f"    [FAILED] Could not move @{username_norm} to Reliable")
                     continue
                 rows_to_delete.append((tab_name, row_num))  # delete source row later (bottom-up to avoid index shift)
                 cat_stats["moved"] += 1
                 run_stats["total_moved"] += 1
-                print(f"    [MOVED] @{norm} from {tab_name} → Reliable row {first_empty}")
-                link_map[norm] = (reliable_tab, first_empty)
+                print(f"    [MOVED] @{username_norm} from {tab_name} → Reliable row {first_empty}")
+                link_map[match_key] = (reliable_tab, first_empty)
             else:
                 first_empty = _get_first_empty_row_in_tab(service, sheet_id, reliable_tab)
                 new_row = _build_row_for_reliable(pay_row, existing_row=None)
@@ -1043,12 +1130,12 @@ def sync_payments_to_manager_sheets(
                     [new_row],
                 ):
                     run_stats["total_api_failures"] += 1
-                    print(f"    [FAILED] Could not add @{norm} to Reliable")
+                    print(f"    [FAILED] Could not add @{username_norm} to Reliable")
                     continue
                 cat_stats["added"] += 1
                 run_stats["total_added"] += 1
-                print(f"    [ADDED] @{norm} to Reliable row {first_empty}")
-                link_map[norm] = (reliable_tab, first_empty)
+                print(f"    [ADDED] @{username_norm} to Reliable row {first_empty}")
+                link_map[match_key] = (reliable_tab, first_empty)
 
         # Delete source rows that were moved (bottom-up so row indices stay valid)
         for tab_name, row_num in sorted(rows_to_delete, key=lambda x: -x[1]):
@@ -1387,6 +1474,21 @@ if __name__ == "__main__":
         print("  _split_tiktok_profiles self-test OK")
 
     _test_split_tiktok_profiles()
+
+    # --- Self-test: canonical normalization (mirror tiktok.py expectations) ---
+    def _test_canonical_normalization() -> None:
+        assert normalize_profile_url("tiktok.com/@User") == "https://www.tiktok.com/@User"
+        assert normalize_username("@User") == "user"
+        assert normalize_link_key("https://www.tiktok.com/@User") == "https://www.tiktok.com/@user"
+        assert normalize_profile_url("https://vt.tiktok.com/xyz") is None
+        un, lk, cu = canonical_tiktok_identity("", "tiktok.com/@abc")
+        assert un == "abc", un
+        assert cu is not None, cu
+        assert lk == cu.lower(), (lk, cu)
+        print("  canonical normalization self-test OK")
+
+    _test_canonical_normalization()
+
     # --- Self-test: _canonicalize_incremented_profile ---
     def _test_canonicalize_incremented() -> None:
         # name=klipolahraga1, profile=@klipolahraga2, seen has klipolahraga1 => rewrite to klipolahraga1
@@ -1414,7 +1516,7 @@ if __name__ == "__main__":
 #   sync_payments_to_manager_sheets, or column mappings.
 #
 # --- Diff-style summary: Incremented trailing-digit canonicalization ---
-# + _extract_tiktok_username(value): normalized username (no @, no URL); "" if invalid.
+# + canonical_tiktok_identity / normalize_username / normalize_link_key: canonical normalization from tiktok.py.
 # + _split_trailing_number(u): (base, digits) if u ends with digits; else (u, "").
 # + _canonicalize_incremented_profile(name_cell, profile_cell, seen_usernames): same base + different trailing
 #   digits only; name_u must be in seen_usernames (canonical target exists in sheet). Returns canonical username or None.
