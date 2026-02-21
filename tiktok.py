@@ -84,7 +84,7 @@ COMBINED_DB_SPREADSHEET_ID = "1VIll8-H7_j3BwknGKwiPRFW0LMIeKcIMV6bZrx2UZ14"
 
 if TEST_MODE:
     SPREADSHEET_ID = "1L7r3rWl0JLVJVypSPML7Y0cvkulYi5LKBOTP7bER9AI"
-    COMBINED_DB_SPREADSHEET_ID = "1mD3-YFe6x7d21yx-I8asCsgkrczvvUbd0konE_fJizo"
+    COMBINED_DB_SPREADSHEET_ID = "1t21VCweRezB0MkgzXimqBKLh7mI6Ri4tEsljFG9dmcA"
 PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
 BUFFER_PROFILE_URL = os.getenv("BUFFER_PROFILE_URL", "https://www.tiktok.com/@tiktok")
 
@@ -956,6 +956,34 @@ def normalize_username(raw_username: str) -> Optional[str]:
     return uname or None
 
 
+def extract_tiktok_profile_urls_from_link_cell(link_cell: Any) -> List[str]:
+    """Extract all canonical TikTok profile URLs from a LINK cell. Does not rewrite the cell."""
+    s = str(link_cell or "").strip().strip("\"'")
+    if not s:
+        return []
+    tokens = re.split(r"[\s,]+", s)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for t in tokens:
+        token = t.strip().strip('"').strip("'")
+        if not token:
+            continue
+        canon = normalize_profile_url(token)
+        if canon and canon not in seen:
+            seen.add(canon)
+            out.append(canon)
+    return out
+
+
+def average_date(dates: List[datetime]) -> str:
+    """Average of datetimes, returned as YYYY-MM-DD. Returns '' if empty."""
+    if not dates:
+        return ""
+    avg_ts = sum(dt.timestamp() for dt in dates) / len(dates)
+    avg_dt = datetime.fromtimestamp(avg_ts)
+    return avg_dt.strftime('%Y-%m-%d')
+
+
 def normalize_profile_url(raw: str) -> Optional[str]:
     """
     Canonicalize TikTok profile URL to https://www.tiktok.com/@username.
@@ -998,9 +1026,8 @@ def normalize_profile_url(raw: str) -> Optional[str]:
         pass
     elif len(segments) == 2 and segments[1] == "likes":
         pass
-    elif len(segments) >= 3 and segments[1] in {"video", "photo"}:
-        pass
     else:
+        # Reject video/photo links (e.g. /@user/video/123) - those are content URLs, not profile URLs
         return None
     return f"https://www.tiktok.com/@{username}"
 
@@ -1787,6 +1814,11 @@ def rebuild_manager_sheet_tabs(service, spreadsheet_id: str, manager_label: str 
             link_ok = bool(link_norm) and str(link_norm).upper() not in ['NA', 'N/A', 'NULL', 'EMPTY'] and str(link_norm).lower() != 'tiktok'
             if not (username_ok or link_ok):
                 continue
+            urls = extract_tiktok_profile_urls_from_link_cell(link_cell)
+            if len(urls) > 1:
+                # multi-URL cell — do NOT touch it; skip canonical fixing entirely
+                all_rows_by_tab[tab_name].append(padded)
+                continue
             canonical_link = normalize_profile_url(padded[COLUMNS['LINK']] if len(padded) > COLUMNS['LINK'] else "")
             canonical_username = canonical_username_from_row(padded)
             if canonical_link:
@@ -1948,27 +1980,34 @@ def read_entire_sheet() -> Dict[str, Any]:
                     continue
                 
                 username_raw = row[COLUMNS['USERNAME']] if len(row) > COLUMNS['USERNAME'] and row[COLUMNS['USERNAME']] else ""
-                link_raw = row[COLUMNS['LINK']] if len(row) > COLUMNS['LINK'] and row[COLUMNS['LINK']] else ""
+                raw_link_cell = str(row[COLUMNS['LINK']] if len(row) > COLUMNS['LINK'] and row[COLUMNS['LINK']] else "")
+                urls = extract_tiktok_profile_urls_from_link_cell(raw_link_cell)
+
+                if not urls:
+                    username_normalized = canonical_username_from_row(row)
+                    if username_normalized:
+                        log_and_print(f"   Profile @{username_normalized} has invalid/empty TikTok profile URL - writing NA and skipping")
+                        sheet_data['profiles_for_na'].append({
+                            "profile_url": raw_link_cell,
+                            "username": normalize_username(username_raw) or username_normalized,
+                            "username_normalized": username_normalized,
+                            "link_key": normalize_link_key(raw_link_cell),
+                        })
+                    continue
+
+                primary_url_for_mapping = urls[0]
                 username_normalized = canonical_username_from_row(row)
+                if not username_normalized:
+                    username_normalized = _username_from_canonical_profile_url(primary_url_for_mapping)
                 if not username_normalized:
                     continue
 
-                raw_link = normalize_profile_link(str(link_raw or ""))
-                canon_link = normalize_profile_url(raw_link)
-                if canon_link is not None:
-                    log_and_print(f"[url][canon] raw={raw_link} -> canon={canon_link}")
-                    link = canon_link
-                else:
-                    fallback = f"https://www.tiktok.com/@{username_normalized}"
-                    log_and_print(f"[url][fallback] raw={raw_link} -> fallback={fallback}")
-                    queue_sheet_value_update(spreadsheet_id, f"{tab_name}!B{i}", [[fallback]], value_input_option='USER_ENTERED')
-                    canon_link = fallback
-                    link = canon_link
-                if not link or str(link).upper() in ['NA', 'N/A', 'NULL', 'EMPTY'] or str(link).lower() == 'tiktok':
+                if str(primary_url_for_mapping).upper() in ['NA', 'N/A', 'NULL', 'EMPTY'] or str(primary_url_for_mapping).lower() == 'tiktok':
                     continue
 
                 username_display = normalize_username(username_raw) or username_normalized
-                link_key = normalize_link_key(link)
+                link_key = normalize_link_key(primary_url_for_mapping)
+                group_key = f"{tab_name}::{i}"
 
                 # Store row mappings for strict username+link rows only.
                 sheet_data['username_to_row'][username_normalized] = (tab_name, i)
@@ -2030,24 +2069,17 @@ def read_entire_sheet() -> Dict[str, Any]:
                         _logger.debug(f"   Row {i} (@{username_normalized}): Skipping scraping (FULL_RUN=False): TikTok Price is not a valid number and Median Views is not empty")
                         continue
                 
-                # Keep sheet LINK as canonical navigation URL.
-                if canon_link is not None:
+                for u in urls:
                     sheet_data['profiles_to_scrape'].append({
-                        "profile_url": canon_link,
+                        "profile_url": u,
                         "username": username_display,
                         "username_normalized": username_normalized,
-                        "link_key": normalize_link_key(canon_link),
+                        "link_key": normalize_link_key(u),
+                        "target_tab": tab_name,
+                        "target_row": i,
+                        "group_key": group_key,
+                        "primary_url_for_mapping": primary_url_for_mapping,
                     })
-                else:
-                    # Invalid/non-profile URL - route to NA handling and skip scraping.
-                    log_and_print(f"   Profile @{username_normalized} has invalid TikTok profile URL - writing NA and skipping")
-                    sheet_data['profiles_for_na'].append({
-                        "profile_url": raw_link,
-                        "username": username_display,
-                        "username_normalized": username_normalized,
-                        "link_key": normalize_link_key(raw_link),
-                    })
-                    continue
         
         log_and_print(f"Found {len(sheet_data['profiles_to_scrape'])} TikTok profiles to scrape across {len(tabs_to_process)} tab(s)")
         if 'profiles_for_na' in sheet_data:
@@ -2140,20 +2172,29 @@ def update_sheet_headers() -> bool:
 
 
 def write_analytics_to_sheet(analytics_data: Dict[str, Any]) -> bool:
-    """Queue analytics write using cached username mapping and previous median cache."""
+    """Queue analytics write using cached username mapping and previous median cache.
+    If analytics_data includes target_tab and target_row, writes directly to that row (no resolve)."""
     try:
         spreadsheet_id = SPREADSHEET_ID
-        username_raw = analytics_data.get('username', '') or ''
-        username_normalized = normalize_username(username_raw)
-        profile_url = normalize_profile_url(str(analytics_data.get("profile_url") or "")) or normalize_profile_link(str(analytics_data.get("profile_url") or ""))
-        if not username_normalized or not profile_url:
-            _logger.warning(f"   Skipping analytics write: missing username/link (@{username_raw}, {profile_url})")
-            return False
-        location = _resolve_profile_location(username_normalized, profile_url)
-        if not location:
-            _logger.error(f"   ERROR: Username @{username_raw} not found in any enabled tab - skipping")
-            return False
-        found_tab, row_number = location
+        target_tab = analytics_data.get('target_tab')
+        target_row = analytics_data.get('target_row')
+        if target_tab is not None and target_row is not None:
+            found_tab = str(target_tab)
+            row_number = int(target_row)
+            username_normalized = normalize_username(analytics_data.get('username', '') or '') or "aggregated"
+            profile_url = str(analytics_data.get("profile_url") or "")
+        else:
+            username_raw = analytics_data.get('username', '') or ''
+            username_normalized = normalize_username(username_raw)
+            profile_url = normalize_profile_url(str(analytics_data.get("profile_url") or "")) or normalize_profile_link(str(analytics_data.get("profile_url") or ""))
+            if not username_normalized or not profile_url:
+                _logger.warning(f"   Skipping analytics write: missing username/link (@{username_raw}, {profile_url})")
+                return False
+            location = _resolve_profile_location(username_normalized, profile_url)
+            if not location:
+                _logger.error(f"   ERROR: Username @{username_raw} not found in any enabled tab - skipping")
+                return False
+            found_tab, row_number = location
         previous_median_views = _current_sheet_data.get('username_to_prev_median', {}).get(username_normalized)
         if previous_median_views is None:
             previous_median_views = _current_sheet_data.get('link_to_prev_median', {}).get(normalize_link_key(profile_url))
@@ -3324,6 +3365,7 @@ def run_scraping_job(page, manager_label: str = ""):
     consecutive_failures = 0
     max_consecutive_failures = 3
     max_retry_attempts = 2
+    aggregated_by_row: Dict[Tuple[str, int], Dict[str, Any]] = {}  # (tab, row) -> accumulator for multi-URL rows
     
     # Import tqdm for progress bars
     from tqdm import tqdm
@@ -3491,7 +3533,7 @@ def run_scraping_job(page, manager_label: str = ""):
                 _logger.info(f"   Added {len(items)} items to results")
                 _logger.info(f"     Profile scraping time: {profile_duration:.2f} seconds ({profile_duration/60:.1f} minutes)")
                 
-                # Calculate analytics for this profile and write to Google Sheets
+                # Calculate analytics for this profile and write to Google Sheets (or accumulate for multi-URL rows)
                 try:
                     profile_stats = calculate_profile_stats(items)
                     username_normalized = normalize_username(username)
@@ -3499,84 +3541,112 @@ def run_scraping_job(page, manager_label: str = ""):
                     if previous_median_views is None:
                         previous_median_views = sheet_data.get('link_to_prev_median', {}).get(normalize_link_key(url))
                     
-                    analytics_data = {
-                        'username': f"@{username}",
-                        'profile_url': url,
-                        'median_views': profile_stats['median_views'],
-                        'videos_under_10k': profile_stats['videos_under_10k'],
-                        'videos_10k_to_100k': profile_stats['videos_10k_to_100k'],
-                        'videos_100k_plus': profile_stats['videos_100k_plus'],
-                        'fifteenth_video_date': profile_stats['fifteenth_video_date'],
-                        'latest_video_date': profile_stats['latest_video_date']
-                    }
+                    target_tab = profile_entry.get("target_tab") if isinstance(profile_entry, dict) else None
+                    target_row = profile_entry.get("target_row") if isinstance(profile_entry, dict) else None
+                    group_key = profile_entry.get("group_key") if isinstance(profile_entry, dict) else None
+                    primary_url_for_mapping = profile_entry.get("primary_url_for_mapping", url) if isinstance(profile_entry, dict) else url
                     
-                    # Check if median views is 0 but previous wasn't - this suggests an error
-                    if profile_stats['median_views'] == 0 and previous_median_views is not None and previous_median_views > 0:
-                        _logger.warning(f"   WARNING: Median views is 0 but previous was {previous_median_views:,} - possible error")
-                        _logger.warning(f"   Retrying profile scrape to verify data...")
+                    if target_tab is not None and target_row is not None and group_key is not None:
+                        # Multi-URL row: accumulate instead of writing immediately
+                        key = (str(target_tab), int(target_row))
+                        if key not in aggregated_by_row:
+                            aggregated_by_row[key] = {
+                                'sum_median_views': 0,
+                                'sum_under_10k': 0,
+                                'sum_10k_100k': 0,
+                                'sum_over_100k': 0,
+                                'fifteenth_dates': [],
+                                'latest_dates': [],
+                                'representative_profile_url': primary_url_for_mapping,
+                                'username': profile_entry.get("username", f"@{username}") if isinstance(profile_entry, dict) else f"@{username}",
+                            }
+                        acc = aggregated_by_row[key]
+                        acc['sum_median_views'] += int(profile_stats.get('median_views', 0) or 0)
+                        acc['sum_under_10k'] += int(profile_stats.get('videos_under_10k', 0) or 0)
+                        acc['sum_10k_100k'] += int(profile_stats.get('videos_10k_to_100k', 0) or 0)
+                        acc['sum_over_100k'] += int(profile_stats.get('videos_100k_plus', 0) or 0)
+                        for dkey, dlist in [('fifteenth_video_date', 'fifteenth_dates'), ('latest_video_date', 'latest_dates')]:
+                            val = profile_stats.get(dkey) or ''
+                            if val and isinstance(val, str):
+                                try:
+                                    acc[dlist].append(datetime.strptime(val, '%Y-%m-%d').replace(tzinfo=timezone.utc))
+                                except (ValueError, TypeError):
+                                    pass
+                        # Skip immediate write - will flush at end of loop
+                        _logger.info(f"   Aggregated analytics for @{username} (multi-URL row {target_tab}:{target_row})")
+                    else:
+                        analytics_data = {
+                            'username': f"@{username}",
+                            'profile_url': url,
+                            'median_views': profile_stats['median_views'],
+                            'videos_under_10k': profile_stats['videos_under_10k'],
+                            'videos_10k_to_100k': profile_stats['videos_10k_to_100k'],
+                            'videos_100k_plus': profile_stats['videos_100k_plus'],
+                            'fifteenth_video_date': profile_stats['fifteenth_video_date'],
+                            'latest_video_date': profile_stats['latest_video_date']
+                        }
                         
-                        # Retry the profile scrape
-                        retry_success = False
-                        for retry_attempt in range(1):  # single fast retry
-                            try:
-                                page = ensure_live_page(page)
-                                retry_items = scrape_profile(url, days=DAYS, page=page)
-                                retry_stats = calculate_profile_stats(retry_items)
-                                
-                                if retry_stats['median_views'] > 0:
-                                    _logger.info(f"   Retry successful: median views {retry_stats['median_views']:,}")
-                                    items = retry_items
-                                    profile_stats = retry_stats
-                                    analytics_data = {
-                                        'username': f"@{username}",
-                                        'profile_url': url,
-                                        'median_views': profile_stats['median_views'],
-                                        'videos_under_10k': profile_stats['videos_under_10k'],
-                                        'videos_10k_to_100k': profile_stats['videos_10k_to_100k'],
-                                        'videos_100k_plus': profile_stats['videos_100k_plus'],
-                                        'fifteenth_video_date': profile_stats['fifteenth_video_date'],
-                                        'latest_video_date': profile_stats['latest_video_date']
-                                    }
-                                    # Update all_rows with the retried items (remove old items for this profile and add new ones)
-                                    all_rows = [row for row in all_rows if row.get("profile", "").lower().lstrip('@') != username_normalized]
-                                    for item in retry_items:
-                                        it_with_profile = {
-                                            "profile": f"@{username}",
-                                            **item,
+                        # Check if median views is 0 but previous wasn't - this suggests an error
+                        if profile_stats['median_views'] == 0 and previous_median_views is not None and previous_median_views > 0:
+                            _logger.warning(f"   WARNING: Median views is 0 but previous was {previous_median_views:,} - possible error")
+                            _logger.warning(f"   Retrying profile scrape to verify data...")
+                            
+                            retry_success = False
+                            for retry_attempt in range(1):
+                                try:
+                                    page = ensure_live_page(page)
+                                    retry_items = scrape_profile(url, days=DAYS, page=page)
+                                    retry_stats = calculate_profile_stats(retry_items)
+                                    
+                                    if retry_stats['median_views'] > 0:
+                                        _logger.info(f"   Retry successful: median views {retry_stats['median_views']:,}")
+                                        items = retry_items
+                                        profile_stats = retry_stats
+                                        analytics_data = {
+                                            'username': f"@{username}",
+                                            'profile_url': url,
+                                            'median_views': profile_stats['median_views'],
+                                            'videos_under_10k': profile_stats['videos_under_10k'],
+                                            'videos_10k_to_100k': profile_stats['videos_10k_to_100k'],
+                                            'videos_100k_plus': profile_stats['videos_100k_plus'],
+                                            'fifteenth_video_date': profile_stats['fifteenth_video_date'],
+                                            'latest_video_date': profile_stats['latest_video_date']
                                         }
-                                        all_rows.append(it_with_profile)
-                                    _logger.info(f"   Updated all_rows with retried data for @{username}")
-                                    retry_success = True
-                                    break
-                                else:
-                                    _logger.info(f"   Retry {retry_attempt + 1} still has median views = 0")
-                            except Exception as retry_e:
-                                _logger.error(f"   Retry attempt {retry_attempt + 1} failed: {retry_e}")
+                                        all_rows = [row for row in all_rows if row.get("profile", "").lower().lstrip('@') != username_normalized]
+                                        for item in retry_items:
+                                            it_with_profile = {"profile": f"@{username}", **item}
+                                            all_rows.append(it_with_profile)
+                                        _logger.info(f"   Updated all_rows with retried data for @{username}")
+                                        retry_success = True
+                                        break
+                                    else:
+                                        _logger.info(f"   Retry {retry_attempt + 1} still has median views = 0")
+                                except Exception as retry_e:
+                                    _logger.error(f"   Retry attempt {retry_attempt + 1} failed: {retry_e}")
+                            
+                            if not retry_success:
+                                _logger.warning(f"   WARNING: All retries failed - median views still 0 for @{username}")
+                                _logger.warning(f"   Proceeding with current data (may be incomplete)")
                         
-                        if not retry_success:
-                            _logger.warning(f"   WARNING: All retries failed - median views still 0 for @{username}")
-                            _logger.warning(f"   Proceeding with current data (may be incomplete)")
-                    
-                    # Write analytics to Google Sheets with retry
-                    sheets_success = False
-                    for sheets_attempt in range(5):  # 5 attempts for Google Sheets write
-                        try:
-                            if write_analytics_to_sheet(analytics_data):
-                                _logger.info(f"   Analytics written to Google Sheets for @{username}")
-                                sheets_success = True
-                                break
-                            else:
-                                if sheets_attempt < 4:
+                        # Write analytics to Google Sheets with retry
+                        sheets_success = False
+                        for sheets_attempt in range(5):
+                            try:
+                                if write_analytics_to_sheet(analytics_data):
+                                    _logger.info(f"   Analytics written to Google Sheets for @{username}")
+                                    sheets_success = True
+                                    break
+                                elif sheets_attempt < 4:
                                     _logger.warning(f"   Retry {sheets_attempt + 2}/5 for Google Sheets write for @{username}")
                                     time.sleep(2)
-                        except Exception as sheets_e:
-                            _logger.error(f"   Google Sheets write attempt {sheets_attempt + 1} failed: {sheets_e}")
-                            if sheets_attempt < 4:
-                                time.sleep(2)
-                    
-                    if not sheets_success:
-                        _logger.error(f"   ERROR: Failed to write analytics to Google Sheets for @{username} after 5 attempts")
-                        _logger.warning(f"   Data preserved in CSV output")
+                            except Exception as sheets_e:
+                                _logger.error(f"   Google Sheets write attempt {sheets_attempt + 1} failed: {sheets_e}")
+                                if sheets_attempt < 4:
+                                    time.sleep(2)
+                        
+                        if not sheets_success:
+                            _logger.error(f"   ERROR: Failed to write analytics to Google Sheets for @{username} after 5 attempts")
+                            _logger.warning(f"   Data preserved in CSV output")
                         
                 except Exception as analytics_e:
                     _logger.error(f"   ERROR calculating analytics for @{username}: {analytics_e}")
@@ -3645,6 +3715,37 @@ def run_scraping_job(page, manager_label: str = ""):
             # Periodic batched flush to reduce API round-trips and bound in-memory queue.
             if i % max(1, SHEETS_WRITE_FLUSH_EVERY_PROFILES) == 0:
                 flush_pending_sheet_writes(f"profile_batch_{i}")
+        
+        # Flush aggregated multi-URL row analytics (one write per row)
+        for (tab_name, row_idx), acc in aggregated_by_row.items():
+            median_out = acc['sum_median_views']
+            fifteenth_out = average_date(acc['fifteenth_dates'])
+            latest_out = average_date(acc['latest_dates'])
+            agg_analytics = {
+                'username': acc['username'],
+                'profile_url': acc['representative_profile_url'],
+                'median_views': median_out,
+                'videos_under_10k': acc['sum_under_10k'],
+                'videos_10k_to_100k': acc['sum_10k_100k'],
+                'videos_100k_plus': acc['sum_over_100k'],
+                'fifteenth_video_date': fifteenth_out,
+                'latest_video_date': latest_out,
+                'target_tab': tab_name,
+                'target_row': row_idx,
+            }
+            for agg_attempt in range(5):
+                try:
+                    if write_analytics_to_sheet(agg_analytics):
+                        _logger.info(f"   Aggregated analytics written to {tab_name} row {row_idx}")
+                        break
+                    elif agg_attempt < 4:
+                        time.sleep(2)
+                except Exception as agg_e:
+                    _logger.error(f"   Aggregated write attempt {agg_attempt + 1} failed: {agg_e}")
+                    if agg_attempt < 4:
+                        time.sleep(2)
+        
+        flush_pending_sheet_writes("aggregated_multi_url_rows")
     
     # Don't close browser - keep it open for next run
     

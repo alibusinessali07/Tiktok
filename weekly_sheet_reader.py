@@ -19,6 +19,104 @@ from urllib.parse import urlparse
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
+
+def normalize_profile_link(link: str) -> str:
+    """Normalize LINK cell for stable keying without changing navigation URL semantics."""
+    if not link:
+        return ""
+    s = str(link)
+    s = re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]", "", s)
+    s = s.replace("\u00A0", " ")
+    return s.strip().strip("\"'").strip()
+
+
+def normalize_username(raw_username: str) -> Optional[str]:
+    """Normalize username to lowercase without leading @."""
+    if raw_username is None:
+        return None
+    uname = str(raw_username).strip().strip("\"'").strip().lower().lstrip("@")
+    return uname or None
+
+
+def normalize_profile_url(raw: str) -> Optional[str]:
+    """
+    Canonicalize TikTok profile URL to https://www.tiktok.com/@username.
+    Returns None when input is not a valid profile URL.
+    """
+    raw_norm = normalize_profile_link(raw)
+    if not raw_norm:
+        return None
+    candidate = raw_norm
+    if "://" not in candidate:
+        candidate = f"https://{candidate.lstrip('/')}"
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower().strip()
+    if host.startswith("www."):
+        bare_host = host[4:]
+    else:
+        bare_host = host
+    if not (bare_host == "tiktok.com" or bare_host.endswith(".tiktok.com")):
+        return None
+    if bare_host == "vt.tiktok.com":
+        return None
+    path = (parsed.path or "").strip()
+    if not path:
+        return None
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return None
+    first = segments[0]
+    if not first.startswith("@"):
+        return None
+    username = first[1:]
+    if not username:
+        return None
+    if not re.fullmatch(r"[\w\.-]+", username):
+        return None
+    if len(segments) == 1:
+        pass
+    elif len(segments) == 2 and segments[1] == "likes":
+        pass
+    elif len(segments) >= 3 and segments[1] in {"video", "photo"}:
+        pass
+    else:
+        return None
+    return f"https://www.tiktok.com/@{username}"
+
+
+def normalize_link_key(link: str) -> str:
+    """Case-insensitive key for link-based row mapping."""
+    canonical = normalize_profile_url(link)
+    if canonical:
+        return canonical.lower()
+    return normalize_profile_link(link).lower()
+
+
+def canonical_tiktok_identity(
+    username_cell: Any, profile_cell: Any
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    Return (username_norm, link_key, canonical_profile_url) for a profile cell.
+    - username_norm: normalized username (lower, no @) from profile or username_cell
+    - link_key: stable key for matching (from normalize_link_key)
+    - canonical_profile_url: https://www.tiktok.com/@user if valid else None
+    """
+    profile_str = str(profile_cell).strip() if profile_cell is not None else ""
+    canonical_profile_url = normalize_profile_url(profile_str)
+    link_key = normalize_link_key(profile_str)
+    username_str = str(username_cell).strip() if username_cell is not None else ""
+    username_norm = normalize_username(username_str)
+    if not username_norm and canonical_profile_url:
+        path = (urlparse(canonical_profile_url).path or "").strip("/").lstrip("@")
+        username_norm = normalize_username(path)
+    if not username_norm and profile_str:
+        username_norm = normalize_username(profile_str)
+    return (username_norm, link_key, canonical_profile_url)
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -160,148 +258,22 @@ HEADER_ROW = 1   # 1-based: row 1 = headers
 DATA_START_ROW = 2   # 1-based: data starts here
 
 
-# =============================================================================
-# CANONICAL TIKTOK NORMALIZATION (from tiktok.py - do NOT reinterpret)
-# =============================================================================
-
-def normalize_profile_link(link: str) -> str:
-    """Normalize LINK cell for stable keying without changing navigation URL semantics."""
-    if not link:
-        return ""
-    s = str(link)
-    s = re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]", "", s)
-    s = s.replace("\u00A0", " ")
-    return s.strip().strip("\"'").strip()
-
-
-def normalize_username(raw_username: str) -> Optional[str]:
-    """Normalize username to lowercase without leading @."""
-    if raw_username is None:
-        return None
-    uname = str(raw_username).strip().strip("\"'").strip().lower().lstrip("@")
-    return uname or None
-
-
-def normalize_profile_url(raw: str) -> Optional[str]:
+def _normalize_tiktok_link(url_or_profile: str) -> Optional[str]:
     """
-    Canonicalize TikTok profile URL to https://www.tiktok.com/@username.
-    Returns None when input is not a valid profile URL.
+    Normalize TikTok URL or @username to lowercase username (no @) for comparison.
+    Returns None if invalid.
     """
-    raw_norm = normalize_profile_link(raw)
-    if not raw_norm:
-        return None
-    candidate = raw_norm
-    if "://" not in candidate:
-        candidate = f"https://{candidate.lstrip('/')}"
-    try:
-        parsed = urlparse(candidate)
-    except Exception:
-        return None
-    host = (parsed.netloc or "").lower().strip()
-    if host.startswith("www."):
-        bare_host = host[4:]
-    else:
-        bare_host = host
-    if not (bare_host == "tiktok.com" or bare_host.endswith(".tiktok.com")):
-        return None
-    if bare_host == "vt.tiktok.com":
-        return None
-    path = (parsed.path or "").strip()
-    if not path:
-        return None
-    segments = [s for s in path.split("/") if s]
-    if len(segments) != 1:
-        return None
-    first = segments[0]
-    if not first.startswith("@"):
-        return None
-    username = first[1:]
-    if not username:
-        return None
-    if not re.fullmatch(r"[\w\.-]+", username):
-        return None
-    return f"https://www.tiktok.com/@{username}"
+    canon = normalize_profile_url(url_or_profile)
+    if canon:
+        path = (urlparse(canon).path or "").strip("/").lstrip("@")
+        return normalize_username(path)
+    return normalize_username(url_or_profile)
 
 
-def _username_from_canonical_profile_url(url: str) -> Optional[str]:
-    """Extract normalized username from canonical profile URL."""
-    canon = normalize_profile_url(url)
-    if not canon:
-        return None
-    parsed = urlparse(canon)
-    segment = (parsed.path or "").strip("/").lstrip("@")
-    return normalize_username(segment)
-
-
-def normalize_link_key(link: str) -> str:
-    """Case-insensitive key for link-based row mapping."""
-    canonical = normalize_profile_url(link)
-    if canonical:
-        return canonical.lower()
-    return normalize_profile_link(link).lower()
-
-
-def canonical_tiktok_identity(
-    username_cell: Any, profile_cell: Any
-) -> Tuple[Optional[str], str, Optional[str]]:
-    """
-    Returns (username_norm, link_key, canonical_profile_url)
-    - username_norm: normalized username (lower, no @) using normalize_username,
-      OR fallback extracted from canonical_profile_url
-    - canonical_profile_url: normalize_profile_url(profile_cell) if valid else None
-    - link_key: normalize_link_key(profile_cell) ALWAYS (even if url invalid/empty)
-      for stable matching
-    """
-    profile_str = str(profile_cell or "").strip() if profile_cell is not None else ""
-    username_str = str(username_cell or "").strip() if username_cell is not None else ""
-
-    canonical_profile_url = normalize_profile_url(profile_str)
-    link_key = normalize_link_key(profile_str)
-
-    username_norm = normalize_username(username_str)
-    if not username_norm and canonical_profile_url:
-        username_norm = _username_from_canonical_profile_url(canonical_profile_url)
-    if not username_norm and profile_str:
-        username_norm = _username_from_canonical_profile_url(profile_str)
-    if not username_norm and profile_str:
-        username_norm = normalize_username(profile_str)
-
-    return (username_norm, link_key, canonical_profile_url)
-
-
-def _split_trailing_number(u: str) -> Tuple[str, str]:
-    """If u ends with digits, return (base_without_digits, digits_str); else return (u, \"\")."""
-    if not u:
-        return ("", "")
-    m = re.match(r"^(.+?)(\d+)$", u)
-    if m:
-        return (m.group(1), m.group(2))
-    return (u, "")
-
-
-def _canonicalize_incremented_profile(
-    name_cell: Any,
-    profile_cell: Any,
-    seen_usernames: Set[str],
-) -> Optional[str]:
-    """
-    If profile looks like same base as Name but with different trailing digits (human typo),
-    and the Name username appears elsewhere in the sheet, return the canonical username (Name).
-    Otherwise return None (no change).
-    """
-    name_u = normalize_username(name_cell) or canonical_tiktok_identity(name_cell, name_cell)[0]
-    prof_u = canonical_tiktok_identity(None, profile_cell)[0]
-    if not name_u or not prof_u:
-        return None
-    if prof_u == name_u:
-        return None
-    name_base, name_digits = _split_trailing_number(name_u)
-    prof_base, prof_digits = _split_trailing_number(prof_u)
-    if prof_base != name_base or not name_digits or not prof_digits or prof_digits == name_digits:
-        return None
-    if name_u not in seen_usernames:
-        return None
-    return name_u
+def _extract_tiktok_username(value: Any) -> str:
+    """Extract normalized TikTok username (no @, no URL). Returns \"\" if empty/invalid."""
+    n = _normalize_tiktok_link(str(value).strip() if value is not None else "")
+    return n or ""
 
 
 # Regexes for extracting multiple TikTok profiles from a single cell
@@ -310,6 +282,35 @@ _TIKTOK_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _AT_USER_PATTERN = re.compile(r"@[\w._-]+")
+
+
+def normalize_tiktok_profile_cell_preserve_format(cell: Any) -> str:
+    """
+    Normalize TikTok profile tokens inside a cell without changing separators/formatting.
+    Replaces each tiktok.com/@... URL with canonical form only. Does not convert plain @username.
+    Does not change non-TikTok text, newlines, spaces, or commas.
+    """
+    if cell is None:
+        return ""
+    raw = str(cell)
+    if not raw:
+        return ""
+
+    result = raw
+    for m in reversed(list(_TIKTOK_URL_PATTERN.finditer(raw))):
+        match_str = m.group(0)
+        canon = normalize_profile_url(match_str)
+        if canon:
+            start, end = m.span()
+            result = result[:start] + canon + result[end:]
+
+    return result
+
+
+def pick_primary_tiktok_profile_from_cell(profile_cell: Any) -> Optional[str]:
+    """Extract the first/primary TikTok profile from a cell. Returns None if none found."""
+    profiles = _split_tiktok_profiles(profile_cell)
+    return profiles[0] if profiles else None
 
 
 def _split_tiktok_profiles(cell: Any) -> List[str]:
@@ -418,6 +419,16 @@ class RateLimiter:
                 result = request_func()
                 self._record_request()
                 return result
+            except (TimeoutError, OSError) as e:
+                err = str(e)
+                if attempt < max_retries - 1:
+                    wait = max(5, (2 ** attempt) + 3)
+                    print(f"    [Retry] {operation_name}: {err[:60]}... waiting {wait}s")
+                    time.sleep(wait)
+                    self.request_times = []
+                else:
+                    print(f"    [WARNING] {operation_name} failed after {max_retries} retries (timeout)")
+                    return None
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RATE_LIMIT" in err or "Quota exceeded" in err:
@@ -656,33 +667,19 @@ def load_sheet_data(
         for col_name, idx in COLUMNS.items():
             value = row[idx] if idx < len(row) else ""
             record[col_name] = value if value is not None else ""
+        record["TikTok Profile"] = normalize_tiktok_profile_cell_preserve_format(
+            record.get("TikTok Profile", "")
+        )
         raw_records.append(record)
-        u = normalize_username(record.get("Name", ""))
+        u = _extract_tiktok_username(record.get("Name", ""))
         if u:
             seen_usernames.add(u)
         for profile in _split_tiktok_profiles(record.get("TikTok Profile", "")):
-            u = canonical_tiktok_identity(None, profile)[0]
+            u = _extract_tiktok_username(profile)
             if u:
                 seen_usernames.add(u)
 
-    # Pass 2: explode by multi-link, then canonicalize incremented trailing-digit typo.
-    rows_out = []
-    for record in raw_records:
-        profiles = _split_tiktok_profiles(record.get("TikTok Profile", ""))
-        if not profiles:
-            rows_out.append(record)
-            continue
-        for profile in profiles:
-            new_record = dict(record)
-            new_record["TikTok Profile"] = profile
-            canonical_u = _canonicalize_incremented_profile(
-                record.get("Name"), profile, seen_usernames
-            )
-            if canonical_u is not None:
-                new_record["TikTok Profile"] = f"https://www.tiktok.com/@{canonical_u}"
-            rows_out.append(new_record)
-
-    return rows_out
+    return raw_records
 
 
 def load_combined_db_sheets(
@@ -833,50 +830,187 @@ def process_payment_data(
             requested = (row.get("Requested by") or "").strip()
             if requested.lower() not in combined_set:
                 continue
-        paid_rows.append({k: row.get(k, "") for k in keys_keep})
+        candidates = _split_tiktok_profiles(row.get("TikTok Profile", ""))
+        if not candidates:
+            continue
+        has_valid_tiktok = any(normalize_profile_url(c) is not None for c in candidates)
+        if not has_valid_tiktok:
+            continue
+        row_out = {k: row.get(k, "") for k in keys_keep}
+        row_out["_payer"] = row.get("Paypal/Crypto", "")
+        paid_rows.append(row_out)
 
-    # Group by (Requested by, TikTok Profile)
-    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    def _canonical_urls_from_profile_cell(cell: Any) -> List[str]:
+        candidates = _split_tiktok_profiles(cell)
+        out: List[str] = []
+        seen: Set[str] = set()
+        for c in candidates:
+            canon = normalize_profile_url(c)
+            if canon and canon not in seen:
+                seen.add(canon)
+                out.append(canon)
+        return out
+
+    def _payer_date_key(r: Dict[str, Any]) -> Tuple[str, str]:
+        payer = str(r.get("_payer") or "").strip().lower()
+        dt = _parse_payment_date(r.get("Payment date"))
+        dt_key = _format_payment_date(dt) if dt else str(r.get("Payment date") or "").strip()
+        return (payer, dt_key)
+
+    def _collapse_increment_typos(
+        usernames: List[str],
+        counts: Counter,
+        first_seen_index: Dict[str, int],
+    ) -> Dict[str, str]:
+        """
+        Returns mapping loser_username -> winner_username for usernames that differ only
+        by last digit (+/-1). Winner = most frequent; tie -> smaller first_seen_index.
+        Only applies when both end with digit, same prefix, abs(last_a - last_b) == 1.
+        """
+        prefix_groups: Dict[str, List[str]] = {}
+        for u in usernames:
+            if not u or len(u) < 2:
+                continue
+            if u[-1].isdigit():
+                prefix = u[:-1]
+                prefix_groups.setdefault(prefix, []).append(u)
+        alias_map: Dict[str, str] = {}
+        for prefix, group in prefix_groups.items():
+            if len(group) < 2:
+                continue
+            group_set = set(group)
+            typo_pairs: List[Tuple[str, str]] = []
+            for a in group:
+                for b in group:
+                    if a >= b:
+                        continue
+                    last_a, last_b = a[-1], b[-1]
+                    if last_a.isdigit() and last_b.isdigit():
+                        if abs(int(last_a) - int(last_b)) == 1:
+                            typo_pairs.append((a, b))
+            if not typo_pairs:
+                continue
+            all_in_group = list(set(a for pair in typo_pairs for a in pair))
+            winner = max(
+                all_in_group,
+                key=lambda x: (counts.get(x, 0), -first_seen_index.get(x, 999999)),
+            )
+            for u in all_in_group:
+                if u != winner:
+                    alias_map[u] = winner
+        return alias_map
+
+    rows_by_requested: Dict[str, List[Dict[str, Any]]] = {}
     for row in paid_rows:
         requested = (row.get("Requested by") or "").strip()
-        profile = (row.get("TikTok Profile") or "").strip()
-        key = (requested, profile)
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(row)
+        rows_by_requested.setdefault(requested, []).append(row)
 
-    # Aggregate each group
     by_requested: Dict[str, List[Dict[str, Any]]] = {}
-    for (requested_by, tiktok_profile), rows in groups.items():
-        if not requested_by and not tiktok_profile:
-            continue
-        # Sum # edits / # views
-        sum_edits = 0.0
-        for r in rows:
-            v = _parse_number(r.get(key_sum))
-            if v is not None:
-                sum_edits += v
-        # Latest Payment date (output format D/M/YYYY)
-        latest_dt = None
-        for r in rows:
-            dt = _parse_payment_date(r.get(key_latest))
-            if dt is not None and (latest_dt is None or dt > latest_dt):
-                latest_dt = dt
-        latest_str = _format_payment_date(latest_dt) if latest_dt else ""
-        # Mode for text/numeric fields (Name, Type of Compensation, Price per edit, Genre, Payment Status)
-        agg = {
-            "Requested by": requested_by,
-            "TikTok Profile": tiktok_profile,
-            key_sum: sum_edits,
-            key_latest: latest_str,
-        }
-        for k in keys_mode:
-            if k in agg:
-                continue
-            agg[k] = _mode([r.get(k) for r in rows])
-        by_requested.setdefault(requested_by, []).append(agg)
+    for requested_by, rows in rows_by_requested.items():
+        parent: Dict[str, str] = {}
 
-    # Sort each category's list by TikTok Profile for stable output
+        def find(x: str) -> str:
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(a: str, b: str) -> None:
+            pa, pb = find(a), find(b)
+            if pa != pb:
+                parent[pa] = pb
+
+        component_rows: Dict[str, List[Dict[str, Any]]] = {}
+        anchor_by_payer_date: Dict[Tuple[str, str], str] = {}
+        for row in rows:
+            urls = _canonical_urls_from_profile_cell(row.get("TikTok Profile", ""))
+            if not urls:
+                continue
+            row["_tiktok_urls"] = urls
+            for u in urls:
+                if u not in parent:
+                    parent[u] = u
+            for i in range(1, len(urls)):
+                union(urls[0], urls[i])
+            key = _payer_date_key(row)
+            payer = key[0]
+            if payer:
+                u0 = urls[0]
+                if key not in anchor_by_payer_date:
+                    anchor_by_payer_date[key] = u0
+                else:
+                    union(anchor_by_payer_date[key], u0)
+
+        for row in rows:
+            urls = row.get("_tiktok_urls", [])
+            if not urls:
+                continue
+            rep = find(urls[0])
+            component_rows.setdefault(rep, []).append(row)
+
+        for _rep, component_rows_list in component_rows.items():
+            seen_urls: Set[str] = set()
+            all_urls_in_order: List[str] = []
+            username_counts: Counter = Counter()
+            first_seen_index: Dict[str, int] = {}
+            idx = 0
+            for r in component_rows_list:
+                for u in r["_tiktok_urls"]:
+                    uname = _extract_tiktok_username(u)
+                    if uname:
+                        username_counts[uname] += 1
+                        if uname not in first_seen_index:
+                            first_seen_index[uname] = idx
+                            idx += 1
+                    if u not in seen_urls:
+                        seen_urls.add(u)
+                        all_urls_in_order.append(u)
+            alias_map = _collapse_increment_typos(
+                list(username_counts.keys()), username_counts, first_seen_index
+            )
+            should_collapse = (
+                len(component_rows_list) > 1 and len(alias_map) > 0
+            )
+            if should_collapse:
+                final_seen: Set[str] = set()
+                final_urls: List[str] = []
+                for u in all_urls_in_order:
+                    uname = _extract_tiktok_username(u)
+                    if uname in alias_map:
+                        winner = alias_map[uname]
+                        canon = f"https://www.tiktok.com/@{winner}"
+                        if canon not in final_seen:
+                            final_seen.add(canon)
+                            final_urls.append(canon)
+                    else:
+                        if u not in final_seen:
+                            final_seen.add(u)
+                            final_urls.append(u)
+                tiktok_profile_out = "\n".join(final_urls)
+            else:
+                tiktok_profile_out = "\n".join(all_urls_in_order)
+            sum_edits = 0.0
+            for r in component_rows_list:
+                v = _parse_number(r.get(key_sum))
+                if v is not None:
+                    sum_edits += v
+            latest_dt = None
+            for r in component_rows_list:
+                dt = _parse_payment_date(r.get(key_latest))
+                if dt is not None and (latest_dt is None or dt > latest_dt):
+                    latest_dt = dt
+            latest_str = _format_payment_date(latest_dt) if latest_dt else ""
+            agg = {
+                "Requested by": requested_by,
+                "TikTok Profile": tiktok_profile_out,
+                key_sum: sum_edits,
+                key_latest: latest_str,
+            }
+            for k in keys_mode:
+                if k in agg:
+                    continue
+                agg[k] = _mode([r.get(k) for r in component_rows_list])
+            by_requested.setdefault(requested_by, []).append(agg)
+
     for cat in by_requested:
         by_requested[cat] = sorted(by_requested[cat], key=lambda r: (r.get("TikTok Profile") or "").lower())
 
@@ -913,10 +1047,13 @@ def _load_manager_sheet_links(
             row_num = i + 1
             if row_num < SOURCE_SHEET_DATA_START_ROW:
                 continue
-            link = (row[0] or "").strip() if row else ""
-            canon = normalize_profile_url(link)
-            if canon:
-                result[normalize_link_key(link)] = (tab_name, row_num)
+            link_cell = (row[0] or "").strip() if row else ""
+            primary = pick_primary_tiktok_profile_from_cell(link_cell)
+            if not primary:
+                continue
+            norm = _normalize_tiktok_link(primary)
+            if norm:
+                result[norm] = (tab_name, row_num)
     return result
 
 
@@ -975,12 +1112,12 @@ def _build_row_for_reliable(
     if existing_row:
         row = list(existing_row)
     username = str(payment_row.get("Name") or "").strip()
-    link = str(payment_row.get("TikTok Profile") or "").strip()
     comp_type = str(payment_row.get("Type of Compensation") or "").strip().lower()
     price = payment_row.get("Price per edit", "")
 
     if not existing_row:
-        row[SOURCE_SHEET_COLUMNS["LINK"]] = link
+        link_cell = normalize_tiktok_profile_cell_preserve_format(payment_row.get("TikTok Profile"))
+        row[SOURCE_SHEET_COLUMNS["LINK"]] = link_cell
     row[SOURCE_SHEET_COLUMNS["USERNAME"]] = username
     row[SOURCE_SHEET_COLUMNS["GENRE"]] = payment_row.get("Genre", "")
     row[SOURCE_SHEET_COLUMNS["TIMES_BOOKED"]] = payment_row.get("# edits / # views", "")
@@ -1067,20 +1204,29 @@ def sync_payments_to_manager_sheets(
                 print(f"    [SKIP Discord] @{profile}...")
                 continue
 
-            profile = str(pay_row.get("TikTok Profile") or "").strip()
-            username_norm, link_key, canonical_url = canonical_tiktok_identity(None, profile)
+            profile_cell = pay_row.get("TikTok Profile")
+            primary = pick_primary_tiktok_profile_from_cell(profile_cell)
+            if primary is None:
+                cat_stats["skipped_invalid"] += 1
+                run_stats["total_skipped_invalid"] += 1
+                print(f"    [SKIP Invalid] Profile: {str(profile_cell)[:50]}")
+                continue
+
+            username_norm, _link_key, canonical_url = canonical_tiktok_identity(None, primary)
             if not username_norm and not canonical_url:
                 cat_stats["skipped_invalid"] += 1
                 run_stats["total_skipped_invalid"] += 1
-                print(f"    [SKIP Invalid] Profile: {profile[:50]}")
+                print(f"    [SKIP Invalid] Profile: {str(primary)[:50]}")
                 continue
 
-            match_key = (
-                normalize_link_key(canonical_url)
-                if canonical_url
-                else normalize_link_key("https://www.tiktok.com/@" + (username_norm or ""))
-            )
-            info = link_map.get(match_key)
+            norm = username_norm or _normalize_tiktok_link(canonical_url or primary)
+            if not norm:
+                cat_stats["skipped_invalid"] += 1
+                run_stats["total_skipped_invalid"] += 1
+                print(f"    [SKIP Invalid] Profile: {str(primary)[:50]}")
+                continue
+
+            info = link_map.get(norm)
 
             if info:
                 tab_name, row_num = info
@@ -1096,10 +1242,10 @@ def sync_payments_to_manager_sheets(
                     ):
                         cat_stats["updated"] += 1
                         run_stats["total_updated"] += 1
-                        print(f"    [UPDATED] @{username_norm} in Reliable row {row_num}")
+                        print(f"    [UPDATED] @{norm} in Reliable row {row_num}")
                     else:
                         run_stats["total_api_failures"] += 1
-                        print(f"    [FAILED] Could not update @{username_norm} (rate limit or API error)")
+                        print(f"    [FAILED] Could not update @{norm} (rate limit or API error)")
                     continue
                 first_empty = _get_first_empty_row_in_tab(service, sheet_id, reliable_tab)
                 existing = _read_row(service, sheet_id, tab_name, row_num)
@@ -1112,13 +1258,13 @@ def sync_payments_to_manager_sheets(
                     [new_row],
                 ):
                     run_stats["total_api_failures"] += 1
-                    print(f"    [FAILED] Could not move @{username_norm} to Reliable")
+                    print(f"    [FAILED] Could not move @{norm} to Reliable")
                     continue
                 rows_to_delete.append((tab_name, row_num))  # delete source row later (bottom-up to avoid index shift)
                 cat_stats["moved"] += 1
                 run_stats["total_moved"] += 1
-                print(f"    [MOVED] @{username_norm} from {tab_name} → Reliable row {first_empty}")
-                link_map[match_key] = (reliable_tab, first_empty)
+                print(f"    [MOVED] @{norm} from {tab_name} → Reliable row {first_empty}")
+                link_map[norm] = (reliable_tab, first_empty)
             else:
                 first_empty = _get_first_empty_row_in_tab(service, sheet_id, reliable_tab)
                 new_row = _build_row_for_reliable(pay_row, existing_row=None)
@@ -1130,12 +1276,12 @@ def sync_payments_to_manager_sheets(
                     [new_row],
                 ):
                     run_stats["total_api_failures"] += 1
-                    print(f"    [FAILED] Could not add @{username_norm} to Reliable")
+                    print(f"    [FAILED] Could not add @{norm} to Reliable")
                     continue
                 cat_stats["added"] += 1
                 run_stats["total_added"] += 1
-                print(f"    [ADDED] @{username_norm} to Reliable row {first_empty}")
-                link_map[match_key] = (reliable_tab, first_empty)
+                print(f"    [ADDED] @{norm} to Reliable row {first_empty}")
+                link_map[norm] = (reliable_tab, first_empty)
 
         # Delete source rows that were moved (bottom-up so row indices stay valid)
         for tab_name, row_num in sorted(rows_to_delete, key=lambda x: -x[1]):
@@ -1462,64 +1608,4 @@ def _main_impl(
 
 
 if __name__ == "__main__":
-    # --- Self-test: _split_tiktok_profiles (no external frameworks) ---
-    def _test_split_tiktok_profiles() -> None:
-        multiline = "https://www.tiktok.com/@user1\nhttps://tiktok.com/@user2\nwww.tiktok.com/@user3"
-        got = _split_tiktok_profiles(multiline)
-        assert len(got) == 3 and "user1" in got[0] and "user2" in got[1] and "user3" in got[2], got
-        got2 = _split_tiktok_profiles("@user1 @user2")
-        assert got2 == ["@user1", "@user2"], got2
-        assert _split_tiktok_profiles("") == []
-        assert _split_tiktok_profiles(None) == []
-        print("  _split_tiktok_profiles self-test OK")
-
-    _test_split_tiktok_profiles()
-
-    # --- Self-test: canonical normalization (mirror tiktok.py expectations) ---
-    def _test_canonical_normalization() -> None:
-        assert normalize_profile_url("tiktok.com/@User") == "https://www.tiktok.com/@User"
-        assert normalize_username("@User") == "user"
-        assert normalize_link_key("https://www.tiktok.com/@User") == "https://www.tiktok.com/@user"
-        assert normalize_profile_url("https://vt.tiktok.com/xyz") is None
-        un, lk, cu = canonical_tiktok_identity("", "tiktok.com/@abc")
-        assert un == "abc", un
-        assert cu is not None, cu
-        assert lk == cu.lower(), (lk, cu)
-        print("  canonical normalization self-test OK")
-
-    _test_canonical_normalization()
-
-    # --- Self-test: _canonicalize_incremented_profile ---
-    def _test_canonicalize_incremented() -> None:
-        # name=klipolahraga1, profile=@klipolahraga2, seen has klipolahraga1 => rewrite to klipolahraga1
-        r = _canonicalize_incremented_profile("klipolahraga1", "@klipolahraga2", {"klipolahraga1"})
-        assert r == "klipolahraga1", r
-        # name=brand1, profile=@brand2, seen does NOT contain brand1 => no rewrite
-        assert _canonicalize_incremented_profile("brand1", "@brand2", set()) is None
-        assert _canonicalize_incremented_profile("brand1", "@brand2", {"brand2"}) is None
-        # name=abc (no trailing digits), profile=@abc2 => no rewrite
-        assert _canonicalize_incremented_profile("abc", "@abc2", {"abc"}) is None
-        # name=abc1, profile=@abd2 => no rewrite (different base)
-        assert _canonicalize_incremented_profile("abc1", "@abd2", {"abc1"}) is None
-        print("  _canonicalize_incremented_profile self-test OK")
-    _test_canonicalize_incremented()
-    # --- End self-test ---
-
     raw, aggregated_by_category, unique_categories = main(use_only_combined_db_categories=False)
-    # use_only_combined_db_categories=True to restrict to names present in Combined DB "Sheets Inputs"
-
-# --- Diff-style summary: Payments multi-profile support ---
-# + _split_tiktok_profiles(cell): regex extract tiktok.com/@... and @user; fallback splitlines/whitespace; strip, dedupe.
-# + load_sheet_data(): after building each record, split "TikTok Profile" with _split_tiktok_profiles; if >1 profile,
-#   explode into N rows (shallow copy, one profile per row); if 1, set and append once; if 0, append as-is.
-# + __main__: self-test for multiline URLs, "@user1 @user2", blank/None. No change to process_payment_data,
-#   sync_payments_to_manager_sheets, or column mappings.
-#
-# --- Diff-style summary: Incremented trailing-digit canonicalization ---
-# + canonical_tiktok_identity / normalize_username / normalize_link_key: canonical normalization from tiktok.py.
-# + _split_trailing_number(u): (base, digits) if u ends with digits; else (u, "").
-# + _canonicalize_incremented_profile(name_cell, profile_cell, seen_usernames): same base + different trailing
-#   digits only; name_u must be in seen_usernames (canonical target exists in sheet). Returns canonical username or None.
-# + load_sheet_data(): two-pass — Pass 1 build raw_records and seen_usernames from Name + TikTok Profile;
-#   Pass 2 explode by multi-link then apply canonicalization during preprocessing (rewrite profile to tiktok.com/@{canonical_u}).
-#   Applied after multi-link explode; process/sync logic untouched.
