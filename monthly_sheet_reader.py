@@ -18,7 +18,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -28,8 +28,11 @@ from googleapiclient.discovery import build
 # CONFIGURATION
 # =============================================================================
 
-SOURCE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg/edit?usp=sharing"
-SOURCE_SPREADSHEET_ID = "1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg"
+# SOURCE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg/edit?usp=sharing"
+# SOURCE_SPREADSHEET_ID = "1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg"
+
+SOURCE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EXrm0FbudIu44LmgSKXZt2lf96XYdOuwyRWf-6yhXus/edit?usp=sharing"
+SOURCE_SPREADSHEET_ID = "1EXrm0FbudIu44LmgSKXZt2lf96XYdOuwyRWf-6yhXus"
 
 DEST_SHEET_URL = "https://docs.google.com/spreadsheets/d/1RS29y36hwIIrgavJXH6NbI1SCqSr4ha4DsXwErS3aPc/edit?usp=sharing"
 DEST_SPREADSHEET_ID = "1RS29y36hwIIrgavJXH6NbI1SCqSr4ha4DsXwErS3aPc"
@@ -81,6 +84,38 @@ _TIKTOK_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _AT_USER_PATTERN = re.compile(r"@[\w._-]+")
+_URL_TOKEN_PATTERN = re.compile(
+    r"(?:https?://[^\s,;\"'<>]+|www\.[^\s,;\"'<>]+|(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s,;\"'<>]+)",
+    re.IGNORECASE,
+)
+_HANDLE_TOKEN_PATTERN = re.compile(r"(?<![\w.])@[\w._-]{2,}", re.IGNORECASE)
+_TRACKING_QS_KEYS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "igshid", "si", "feature", "fbclid", "gclid",
+}
+DEBUG_CSV_FIELDS = [
+    "row_id",
+    "tab_name",
+    "source_row_number",
+    "payment_date_raw",
+    "strict_month_key",
+    "strict_month_source",
+    "fallback_month_key",
+    "fallback_month_source",
+    "month_key",
+    "month_source",
+    "requested_by",
+    "profile_platform",
+    "profile_key",
+    "profile_key_final",
+    "profile_canonical_url",
+    "profile_canonical_handle",
+    "merge_alias_to",
+    "merge_applied",
+    "videos_posted_num",
+    "total_spent_num",
+    "finished_filter_pass",
+]
 
 
 def normalize_profile_link(link: str) -> str:
@@ -102,49 +137,233 @@ def normalize_username(raw_username: str) -> Optional[str]:
 
 
 def normalize_profile_url(raw: str) -> Optional[str]:
-    """
-    Canonicalize TikTok profile URL to https://www.tiktok.com/@username.
-    Returns None when input is not a valid profile URL.
-    """
-    raw_norm = normalize_profile_link(raw)
-    if not raw_norm:
+    """Backward-compatible TikTok-only canonicalizer wrapper."""
+    ident = canonicalize_profile_token(raw)
+    if ident.get("platform") == "tiktok":
+        return ident.get("canonical_url")
+    return None
+
+
+def _clean_url_token(token: str) -> Optional[str]:
+    t = normalize_profile_link(token)
+    if not t:
         return None
-    candidate = raw_norm
-    if "://" not in candidate:
-        candidate = f"https://{candidate.lstrip('/')}"
+    if t.lower().startswith("www."):
+        t = "https://" + t
+    elif "://" not in t and re.match(r"^[a-z0-9-]+\.[a-z]{2,}/", t, re.IGNORECASE):
+        t = "https://" + t
+    if "://" not in t:
+        return None
+    return t
+
+
+def _normalized_query(query: str) -> str:
+    if not query:
+        return ""
+    pairs = parse_qsl(query, keep_blank_values=True)
+    filtered = [(k, v) for k, v in pairs if k.lower() not in _TRACKING_QS_KEYS]
+    return urlencode(filtered, doseq=True)
+
+
+def _normalize_generic_url(url: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Returns (canonical_url, host, path_lower_no_trailing_slash) or None.
+    """
     try:
-        parsed = urlparse(candidate)
+        p = urlparse(url)
     except Exception:
         return None
-    host = (parsed.netloc or "").lower().strip()
-    bare_host = host[4:] if host.startswith("www.") else host
-    if not (bare_host == "tiktok.com" or bare_host.endswith(".tiktok.com")):
+    host = (p.netloc or "").lower().strip()
+    if not host:
         return None
-    if bare_host == "vt.tiktok.com":
-        return None
-    path = (parsed.path or "").strip()
+    host = host[4:] if host.startswith("www.") else host
+    path = (p.path or "").strip()
+    path = re.sub(r"/+", "/", path).rstrip("/")
     if not path:
+        path = "/"
+    query = _normalized_query(p.query or "")
+    canonical = urlunparse(("https", host, path, "", query, ""))
+    return canonical, host, path.lower()
+
+
+def _first_path_segment(path: str) -> str:
+    segs = [s for s in (path or "").split("/") if s]
+    return segs[0] if segs else ""
+
+
+def extract_profile_tokens(cell: Any) -> List[str]:
+    """
+    Extract candidate profile tokens from a cell.
+    Priority extraction: URLs first, then @handles, then text fragments fallback.
+    """
+    if cell is None:
+        return []
+    raw = normalize_profile_link(str(cell))
+    if not raw:
+        return []
+
+    tokens: List[str] = []
+    seen: Set[str] = set()
+
+    for m in _URL_TOKEN_PATTERN.finditer(raw):
+        tok = normalize_profile_link(m.group(0))
+        if tok and tok not in seen:
+            seen.add(tok)
+            tokens.append(tok)
+
+    for m in _HANDLE_TOKEN_PATTERN.finditer(raw):
+        tok = normalize_profile_link(m.group(0))
+        if tok and tok not in seen:
+            seen.add(tok)
+            tokens.append(tok)
+
+    if tokens:
+        return tokens
+
+    for part in re.split(r"[\n,;|]+", raw):
+        t = normalize_profile_link(part)
+        if t and t not in seen:
+            seen.add(t)
+            tokens.append(t)
+    return tokens
+
+
+def canonicalize_profile_token(token: str) -> Dict[str, Any]:
+    """
+    Canonicalize a token into a unified identity structure:
+    {platform, key, canonical_url, canonical_handle, source_type}
+    """
+    tok = normalize_profile_link(token)
+    if not tok:
+        return {
+            "platform": "text",
+            "key": "",
+            "canonical_url": "",
+            "canonical_handle": "",
+            "source_type": "text",
+        }
+
+    # Handle-only token (@name) – keep as text handle bucket for now.
+    if tok.startswith("@") and len(tok) > 1:
+        h = normalize_username(tok) or ""
+        return {
+            "platform": "text",
+            "key": f"text:{h}" if h else "",
+            "canonical_url": "",
+            "canonical_handle": h,
+            "source_type": "handle",
+        }
+
+    url_tok = _clean_url_token(tok)
+    if url_tok:
+        norm = _normalize_generic_url(url_tok)
+        if norm:
+            canonical_url, host, path_lower = norm
+            seg0 = _first_path_segment(path_lower)
+
+            # TikTok
+            if host.endswith("tiktok.com"):
+                handle = normalize_username(seg0) if seg0.startswith("@") else None
+                if handle:
+                    return {
+                        "platform": "tiktok",
+                        "key": f"tiktok:{handle}",
+                        "canonical_url": f"https://www.tiktok.com/@{handle}",
+                        "canonical_handle": handle,
+                        "source_type": "url",
+                    }
+
+            # Instagram
+            if host.endswith("instagram.com"):
+                reserved = {"p", "reel", "reels", "tv", "explore", "accounts"}
+                handle = normalize_username(seg0) if seg0 and seg0 not in reserved else None
+                if handle:
+                    return {
+                        "platform": "instagram",
+                        "key": f"instagram:{handle}",
+                        "canonical_url": f"https://www.instagram.com/{handle}",
+                        "canonical_handle": handle,
+                        "source_type": "url",
+                    }
+
+            # YouTube
+            if host.endswith("youtube.com") or host == "youtu.be":
+                handle = normalize_username(seg0) if seg0.startswith("@") else None
+                if handle:
+                    return {
+                        "platform": "youtube",
+                        "key": f"youtube:{handle}",
+                        "canonical_url": f"https://www.youtube.com/@{handle}",
+                        "canonical_handle": handle,
+                        "source_type": "url",
+                    }
+                segs = [s for s in path_lower.split("/") if s]
+                if len(segs) >= 2 and segs[0] in {"channel", "user", "c"}:
+                    ch = normalize_username(segs[1]) or segs[1]
+                    return {
+                        "platform": "youtube",
+                        "key": f"youtube:{segs[0]}:{ch}",
+                        "canonical_url": canonical_url,
+                        "canonical_handle": ch,
+                        "source_type": "url",
+                    }
+
+            # Generic URL domain fallback.
+            generic_key = f"domain:{host}:{path_lower or '/'}"
+            return {
+                "platform": f"domain:{host}",
+                "key": generic_key,
+                "canonical_url": canonical_url,
+                "canonical_handle": normalize_username(seg0) if seg0 else "",
+                "source_type": "url",
+            }
+
+    # Non-url text fallback
+    txt = re.sub(r"\s+", " ", tok.casefold()).strip()
+    return {
+        "platform": "text",
+        "key": f"text:{txt}" if txt else "",
+        "canonical_url": "",
+        "canonical_handle": "",
+        "source_type": "text",
+    }
+
+
+def pick_primary_profile_identity(cell: Any) -> Optional[Dict[str, Any]]:
+    """
+    Pick a deterministic primary identity from a profile cell.
+    URL tokens preferred, then text; platform priority among URLs:
+    tiktok > instagram > youtube > other domains > text.
+    """
+    tokens = extract_profile_tokens(cell)
+    if not tokens:
         return None
-    segments = [s for s in path.split("/") if s]
-    if not segments:
+    identities = []
+    for i, t in enumerate(tokens):
+        ident = canonicalize_profile_token(t)
+        if ident.get("key"):
+            identities.append((i, ident))
+    if not identities:
         return None
-    first = segments[0]
-    if not first.startswith("@"):
-        return None
-    username = first[1:]
-    if not username:
-        return None
-    if not re.fullmatch(r"[\w\.-]+", username):
-        return None
-    if len(segments) == 1:
-        pass
-    elif len(segments) == 2 and segments[1] == "likes":
-        pass
-    elif len(segments) >= 3 and segments[1] in {"video", "photo"}:
-        pass
-    else:
-        return None
-    return f"https://www.tiktok.com/@{username}"
+
+    def _prio(ident: Dict[str, Any]) -> int:
+        p = ident.get("platform", "")
+        s = ident.get("source_type", "")
+        if p == "tiktok":
+            return 0
+        if p == "instagram":
+            return 1
+        if p == "youtube":
+            return 2
+        if s == "url":
+            return 3
+        return 4
+
+    identities.sort(key=lambda x: (_prio(x[1]), x[0]))
+    out = dict(identities[0][1])
+    out["tokens_raw"] = tokens
+    out["tokens_canonical"] = [it[1].get("key", "") for it in identities]
+    return out
 
 
 def normalize_tiktok_profile_cell_preserve_format(cell: Any) -> str:
@@ -152,6 +371,7 @@ def normalize_tiktok_profile_cell_preserve_format(cell: Any) -> str:
     Normalize TikTok URLs in a cell to canonical profile URLs, while preserving
     separators/format.
     """
+    # Backward-compat wrapper; keep original behavior for TikTok URL replacement.
     if cell is None:
         return ""
     raw = str(cell)
@@ -171,57 +391,17 @@ def _split_tiktok_profiles(cell: Any) -> List[str]:
     """
     Split profile cell that may contain multiple values into URL/@username tokens.
     """
-    if cell is None:
-        return []
-    raw = str(cell).strip().strip("\"'")
-    if not raw:
-        return []
-
-    urls = _TIKTOK_URL_PATTERN.findall(raw)
-    if urls:
-        seen: Set[str] = set()
-        out: List[str] = []
-        for u in urls:
-            s = u.strip().strip("\"'")
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
-
-    at_users = _AT_USER_PATTERN.findall(raw)
-    if at_users:
-        seen = set()
-        out = []
-        for a in at_users:
-            s = a.strip().strip("\"'")
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
-
-    tokens: List[str] = []
-    for line in raw.splitlines():
-        for part in line.replace(",", " ").split():
-            s = part.strip().strip("\"'")
-            if s:
-                tokens.append(s)
-
-    seen = set()
-    out = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    # Backward-compat wrapper.
+    return extract_profile_tokens(cell)
 
 
 def canonical_primary_tiktok_profile(cell: Any) -> Optional[str]:
-    """Return canonical profile URL for the first valid profile found in a cell."""
-    cleaned = normalize_tiktok_profile_cell_preserve_format(cell)
-    for candidate in _split_tiktok_profiles(cleaned):
-        canon = normalize_profile_url(candidate)
-        if canon:
-            return canon
+    """Backward-compat wrapper returning TikTok canonical URL when possible."""
+    ident = pick_primary_profile_identity(cell)
+    if not ident:
+        return None
+    if ident.get("platform") == "tiktok":
+        return ident.get("canonical_url")
     return None
 
 
@@ -563,7 +743,13 @@ def _debug_rows_projection(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "month_key": r.get("month_key"),
                 "month_source": r.get("month_source"),
                 "requested_by": r.get("requested_by"),
-                "tiktok_profile_canon": r.get("tiktok_profile_canon"),
+                "profile_platform": r.get("profile_platform"),
+                "profile_key": r.get("profile_key"),
+                "profile_key_final": r.get("profile_key_final"),
+                "profile_canonical_url": r.get("profile_canonical_url"),
+                "profile_canonical_handle": r.get("profile_canonical_handle"),
+                "merge_alias_to": r.get("merge_alias_to"),
+                "merge_applied": r.get("merge_applied"),
                 "videos_posted_num": r.get("videos_posted_num"),
                 "total_spent_num": r.get("total_spent_num"),
                 "finished_filter_pass": r.get("finished_filter_pass"),
@@ -694,6 +880,87 @@ def recompute_month_fields(
     return rebuilt, counters
 
 
+def _has_consecutive_run(nums: List[int], run_len: int = 3) -> bool:
+    if len(nums) < run_len:
+        return False
+    s = sorted(set(nums))
+    streak = 1
+    for i in range(1, len(s)):
+        if s[i] == s[i - 1] + 1:
+            streak += 1
+            if streak >= run_len:
+                return True
+        else:
+            streak = 1
+    return False
+
+
+def apply_conservative_drag_merge(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, int]]:
+    """
+    Conservative merge for drag-generated suffix sequences.
+    Scope: same (month_key, requested_by, profile_platform), handle-based keys only.
+    """
+    alias_map: Dict[str, str] = {}
+    stats = {"drag_merge_groups": 0, "drag_merge_aliases_applied": 0}
+
+    grouped: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        grouped[(r.get("month_key", ""), r.get("requested_by", ""), r.get("profile_platform", ""))].append(r)
+
+    for (_month, _member, platform), grp in grouped.items():
+        if platform not in {"tiktok", "instagram", "youtube"}:
+            continue
+
+        by_base: Dict[str, List[Tuple[str, int]]] = defaultdict(list)  # base -> [(profile_key, suffix_num)]
+        counts: Counter = Counter()
+        first_seen: Dict[str, int] = {}
+        order = 0
+
+        for r in grp:
+            k = r.get("profile_key", "")
+            h = (r.get("profile_canonical_handle") or "").lower()
+            if not k or not h:
+                continue
+            counts[k] += 1
+            if k not in first_seen:
+                first_seen[k] = order
+                order += 1
+            m = re.match(r"^(.*?)(\d{1,4})$", h)
+            if not m:
+                continue
+            base = m.group(1)
+            suf = int(m.group(2))
+            if not base:
+                continue
+            by_base[base].append((k, suf))
+
+        for base, pairs in by_base.items():
+            nums = [p[1] for p in pairs]
+            if not _has_consecutive_run(nums, run_len=3):
+                continue
+            unique_keys = sorted(set(p[0] for p in pairs))
+            if len(unique_keys) < 2:
+                continue
+            stats["drag_merge_groups"] += 1
+            winner = max(unique_keys, key=lambda kk: (counts.get(kk, 0), -first_seen.get(kk, 999999)))
+            for loser in unique_keys:
+                if loser != winner:
+                    alias_map[loser] = winner
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        src_key = rr.get("profile_key", "")
+        dst_key = alias_map.get(src_key, src_key)
+        rr["profile_key_final"] = dst_key
+        rr["merge_applied"] = dst_key != src_key
+        rr["merge_alias_to"] = dst_key if dst_key != src_key else ""
+        if rr["merge_applied"]:
+            stats["drag_merge_aliases_applied"] += 1
+        out.append(rr)
+    return out, alias_map, stats
+
+
 def load_all_tabs_paid_rows(
     service,
     spreadsheet_id: str,
@@ -766,10 +1033,18 @@ def load_all_tabs_paid_rows(
                 stats["rows_dropped_no_usable_month"] += 1
                 continue
 
-            profile_canon = canonical_primary_tiktok_profile(_get("TikTok Profile"))
-            if not profile_canon:
-                dropped["invalid_tiktok_profile"] += 1
+            profile_ident = pick_primary_profile_identity(_get("TikTok Profile"))
+            if not profile_ident or not profile_ident.get("key"):
+                dropped["invalid_profile_identity"] += 1
                 continue
+            source_type = profile_ident.get("source_type", "")
+            if source_type == "url":
+                stats["rows_with_url_profile"] += 1
+            else:
+                stats["rows_with_text_profile"] += 1
+            p = profile_ident.get("platform", "text")
+            platform_counts = stats.setdefault("platform_counts", {})
+            platform_counts[p] = platform_counts.get(p, 0) + 1
 
             song_norm = normalize_song_title(_get("Song Title"))
             videos_num = _parse_number(_get("# edits / # views")) or 0.0
@@ -783,7 +1058,13 @@ def load_all_tabs_paid_rows(
                     "source_row_number": row_idx_1based,
                     "requested_by": requested_by,
                     "song_title_norm": song_norm,
-                    "tiktok_profile_canon": profile_canon,
+                    "profile_platform": profile_ident.get("platform", "text"),
+                    "profile_key": profile_ident.get("key", ""),
+                    "profile_key_final": profile_ident.get("key", ""),
+                    "profile_canonical_url": profile_ident.get("canonical_url", ""),
+                    "profile_canonical_handle": profile_ident.get("canonical_handle", ""),
+                    "profile_tokens_raw": profile_ident.get("tokens_raw", []),
+                    "profile_tokens_canonical": profile_ident.get("tokens_canonical", []),
                     "payment_date_dt": _parse_payment_date(_get("Payment date")),
                     "payment_date_raw": _get("Payment date"),
                     "month_key": month_key,
@@ -793,6 +1074,8 @@ def load_all_tabs_paid_rows(
                     "strict_month_source": month_source,
                     "fallback_month_key": "",
                     "fallback_month_source": "",
+                    "merge_alias_to": "",
+                    "merge_applied": False,
                     "finished_filter_pass": "none",
                     "videos_posted_num": videos_num,
                     "total_spent_num": spent_num,
@@ -808,12 +1091,14 @@ def build_first_paid_dictionaries(
     rows: List[Dict[str, Any]]
 ) -> Tuple[Dict[str, datetime], Dict[str, str], Dict[str, str]]:
     """
-    Build first-paid dictionaries by canonical TikTok profile.
+    Build first-paid dictionaries by final canonical profile key.
     Tie-breaker for same profile/date uses first (tab_order, source_row_number).
     """
     first_seen: Dict[str, Tuple[datetime, int, int, str]] = {}
     for r in rows:
-        profile = r["tiktok_profile_canon"]
+        profile = r.get("profile_key_final") or r.get("profile_key") or ""
+        if not profile:
+            continue
         dt = r.get("payment_date_dt") or r["month_start_dt"]
         tord = r["tab_order"]
         srow = r["source_row_number"]
@@ -857,7 +1142,9 @@ def aggregate_monthly_metrics(
         song_key = r["song_title_norm"]
         if song_key:
             g["_songs"].add(song_key)
-        g["_profiles"].add(r["tiktok_profile_canon"])
+        profile_key = r.get("profile_key_final") or r.get("profile_key") or ""
+        if profile_key:
+            g["_profiles"].add(profile_key)
         g["_rows"] += 1
         g["_videos_sum"] += float(r["videos_posted_num"] or 0.0)
         g["_spent_sum"] += float(r["total_spent_num"] or 0.0)
@@ -900,6 +1187,14 @@ def _to_int_if_whole(v: float) -> Any:
     return int(v) if isinstance(v, float) and v.is_integer() else v
 
 
+def _to_int_rounded(v: Any) -> int:
+    """Force integer output for metrics that must display as whole numbers."""
+    try:
+        return int(round(float(v)))
+    except Exception:
+        return 0
+
+
 def build_output_values(
     aggregated_rows: List[Dict[str, Any]],
     months_sorted: List[str],
@@ -937,11 +1232,11 @@ def build_output_values(
                 [
                     r["Month"],
                     r["Member"],
-                    _to_int_if_whole(float(r["# of Songs"])),
-                    _to_int_if_whole(float(r["# of pages commissioned"])),
-                    _to_int_if_whole(float(r["# of UNIQUE pages commissioned"])),
-                    _to_int_if_whole(float(r["# of NEW UNIQUE pages commissioned"])),
-                    _to_int_if_whole(float(r["# of Videos Posted"])),
+                    _to_int_rounded(r["# of Songs"]),
+                    _to_int_rounded(r["# of pages commissioned"]),
+                    _to_int_rounded(r["# of UNIQUE pages commissioned"]),
+                    _to_int_rounded(r["# of NEW UNIQUE pages commissioned"]),
+                    _to_int_rounded(r["# of Videos Posted"]),
                     float(r["Average videos per editor"]),
                     float(r["Total Spent"]),
                     float(r["Average cost per video"]),
@@ -989,7 +1284,7 @@ def _build_format_requests(
                         "startColumnIndex": 2,
                         "endColumnIndex": 7,
                     },
-                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0.##"}}},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0"}}},
                     "fields": "userEnteredFormat.numberFormat",
                 }
             }
@@ -1004,7 +1299,7 @@ def _build_format_requests(
                         "startColumnIndex": 7,
                         "endColumnIndex": 8,
                     },
-                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}}},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}}},
                     "fields": "userEnteredFormat.numberFormat",
                 }
             }
@@ -1210,11 +1505,16 @@ def main() -> Dict[str, Any]:
         "rows_with_date_tab_mismatch": 0,
         "rows_dropped_no_usable_month": 0,
         "finished_filter_cutoff_month": "",
+        "rows_with_url_profile": 0,
+        "rows_with_text_profile": 0,
+        "platform_counts": {},
         "used_tab_month_zero_finished_fallback": False,
         "rows_recovered_by_tab_month_fallback": 0,
         "months_after_fallback": 0,
         "strict_finished_rows": 0,
         "fallback_finished_rows": 0,
+        "drag_merge_groups": 0,
+        "drag_merge_aliases_applied": 0,
         "debug_run_id": debug_run_id,
         "debug_output_dir": str(debug_dir) if debug_dir else "",
     }
@@ -1248,23 +1548,7 @@ def main() -> Dict[str, Any]:
             write_debug_csv(
                 debug_dir / "01_rows_normalized.csv",
                 _debug_rows_projection(rows),
-                [
-                    "row_id",
-                    "tab_name",
-                    "source_row_number",
-                    "payment_date_raw",
-                    "strict_month_key",
-                    "strict_month_source",
-                    "fallback_month_key",
-                    "fallback_month_source",
-                    "month_key",
-                    "month_source",
-                    "requested_by",
-                    "tiktok_profile_canon",
-                    "videos_posted_num",
-                    "total_spent_num",
-                    "finished_filter_pass",
-                ],
+                DEBUG_CSV_FIELDS,
             )
 
         months_before_map = month_distribution(rows)
@@ -1278,6 +1562,10 @@ def main() -> Dict[str, Any]:
         print(f"    - rows_with_tab_month_fallback: {stats['rows_with_tab_month_fallback']}")
         print(f"    - rows_with_date_tab_mismatch: {stats['rows_with_date_tab_mismatch']}")
         print(f"    - rows_dropped_no_usable_month: {stats['rows_dropped_no_usable_month']}")
+        print("  Profile identity diagnostics:")
+        print(f"    - rows_with_url_profile: {stats['rows_with_url_profile']}")
+        print(f"    - rows_with_text_profile: {stats['rows_with_text_profile']}")
+        print(f"    - platform_counts: {stats.get('platform_counts', {})}")
         if WRITE_DEBUG_ARTIFACTS and debug_dir:
             write_debug_json(debug_dir / "month_counts_strict.json", months_before_map)
 
@@ -1320,23 +1608,7 @@ def main() -> Dict[str, Any]:
             write_debug_csv(
                 debug_dir / "02_rows_after_strict_finished_filter.csv",
                 _debug_rows_projection(rows),
-                [
-                    "row_id",
-                    "tab_name",
-                    "source_row_number",
-                    "payment_date_raw",
-                    "strict_month_key",
-                    "strict_month_source",
-                    "fallback_month_key",
-                    "fallback_month_source",
-                    "month_key",
-                    "month_source",
-                    "requested_by",
-                    "tiktok_profile_canon",
-                    "videos_posted_num",
-                    "total_spent_num",
-                    "finished_filter_pass",
-                ],
+                DEBUG_CSV_FIELDS,
             )
             write_debug_json(debug_dir / "month_counts_after_strict_filter.json", months_after_map)
 
@@ -1396,23 +1668,7 @@ def main() -> Dict[str, Any]:
                 write_debug_csv(
                     debug_dir / "03_rows_after_tab_fallback_filter.csv",
                     _debug_rows_projection(fallback_rows),
-                    [
-                        "row_id",
-                        "tab_name",
-                        "source_row_number",
-                        "payment_date_raw",
-                        "strict_month_key",
-                        "strict_month_source",
-                        "fallback_month_key",
-                        "fallback_month_source",
-                        "month_key",
-                        "month_source",
-                        "requested_by",
-                        "tiktok_profile_canon",
-                        "videos_posted_num",
-                        "total_spent_num",
-                        "finished_filter_pass",
-                    ],
+                    DEBUG_CSV_FIELDS,
                 )
                 write_debug_json(debug_dir / "month_counts_after_fallback_filter.json", fallback_after_map)
 
@@ -1433,6 +1689,18 @@ def main() -> Dict[str, Any]:
                     f"source={sample.get('month_source')}"
                 )
             print("!" * 72)
+
+        print("\n" + "-" * 72)
+        print("  STEP 3.5: Apply conservative drag-error merge")
+        print("-" * 72)
+        rows, alias_map, merge_stats = apply_conservative_drag_merge(rows)
+        stats["drag_merge_groups"] = merge_stats.get("drag_merge_groups", 0)
+        stats["drag_merge_aliases_applied"] = merge_stats.get("drag_merge_aliases_applied", 0)
+        print(f"  Drag merge groups: {stats['drag_merge_groups']}")
+        print(f"  Drag merge aliases applied: {stats['drag_merge_aliases_applied']}")
+        if WRITE_DEBUG_ARTIFACTS and debug_dir:
+            write_debug_json(debug_dir / "drag_merge_alias_map.json", alias_map)
+            write_debug_json(debug_dir / "profile_platform_counts.json", stats.get("platform_counts", {}))
 
         print("\n" + "-" * 72)
         print("  STEP 4: Build first-paid dictionaries")
@@ -1497,6 +1765,11 @@ def main() -> Dict[str, Any]:
             "rows_with_date_tab_mismatch",
             "rows_dropped_no_usable_month",
             "finished_filter_cutoff_month",
+            "rows_with_url_profile",
+            "rows_with_text_profile",
+            "platform_counts",
+            "drag_merge_groups",
+            "drag_merge_aliases_applied",
             "used_tab_month_zero_finished_fallback",
             "rows_recovered_by_tab_month_fallback",
             "months_after_fallback",
