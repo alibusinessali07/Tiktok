@@ -14,6 +14,7 @@ import time
 import traceback
 import json
 import csv
+import colorsys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,15 +29,11 @@ from googleapiclient.discovery import build
 # CONFIGURATION
 # =============================================================================
 
-# SOURCE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg/edit?usp=sharing"
-# SOURCE_SPREADSHEET_ID = "1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg"
-
-SOURCE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EXrm0FbudIu44LmgSKXZt2lf96XYdOuwyRWf-6yhXus/edit?usp=sharing"
 SOURCE_SPREADSHEET_ID = "1EXrm0FbudIu44LmgSKXZt2lf96XYdOuwyRWf-6yhXus"
 
-DEST_SHEET_URL = "https://docs.google.com/spreadsheets/d/1RS29y36hwIIrgavJXH6NbI1SCqSr4ha4DsXwErS3aPc/edit?usp=sharing"
 DEST_SPREADSHEET_ID = "1RS29y36hwIIrgavJXH6NbI1SCqSr4ha4DsXwErS3aPc"
 DEST_MONTHLY_TAB_NAME = "Monthly"
+DEST_WEEKLY_TAB_NAME = "Weekly"
 
 # Column mapping (0-based index). Headers assumed on row 1; data from row 2.
 COLUMNS = {
@@ -73,17 +70,25 @@ OUTPUT_HEADERS = [
     "Average cost per video",
 ]
 
+WEEKLY_OUTPUT_HEADERS = [
+    "Week",
+    "Member",
+    "# of Songs",
+    "# of pages commissioned",
+    "# of UNIQUE pages commissioned",
+    "# of NEW UNIQUE pages commissioned",
+    "# of Videos Posted",
+    "Average videos per editor",
+    "Total Spent",
+    "Average cost per video",
+]
+
 
 # =============================================================================
 # NORMALIZATION HELPERS
 # =============================================================================
 
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]")
-_TIKTOK_URL_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?tiktok\.com/@[\w._-]+",
-    re.IGNORECASE,
-)
-_AT_USER_PATTERN = re.compile(r"@[\w._-]+")
 _URL_TOKEN_PATTERN = re.compile(
     r"(?:https?://[^\s,;\"'<>]+|www\.[^\s,;\"'<>]+|(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s,;\"'<>]+)",
     re.IGNORECASE,
@@ -104,6 +109,9 @@ DEBUG_CSV_FIELDS = [
     "fallback_month_source",
     "month_key",
     "month_source",
+    "week_key",
+    "week_source",
+    "week_start_dt",
     "requested_by",
     "profile_platform",
     "profile_key",
@@ -134,14 +142,6 @@ def normalize_username(raw_username: str) -> Optional[str]:
         return None
     uname = str(raw_username).strip().strip("\"'").strip().lower().lstrip("@")
     return uname or None
-
-
-def normalize_profile_url(raw: str) -> Optional[str]:
-    """Backward-compatible TikTok-only canonicalizer wrapper."""
-    ident = canonicalize_profile_token(raw)
-    if ident.get("platform") == "tiktok":
-        return ident.get("canonical_url")
-    return None
 
 
 def _clean_url_token(token: str) -> Optional[str]:
@@ -366,45 +366,6 @@ def pick_primary_profile_identity(cell: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
-def normalize_tiktok_profile_cell_preserve_format(cell: Any) -> str:
-    """
-    Normalize TikTok URLs in a cell to canonical profile URLs, while preserving
-    separators/format.
-    """
-    # Backward-compat wrapper; keep original behavior for TikTok URL replacement.
-    if cell is None:
-        return ""
-    raw = str(cell)
-    if not raw:
-        return ""
-    result = raw
-    for m in reversed(list(_TIKTOK_URL_PATTERN.finditer(raw))):
-        match_str = m.group(0)
-        canon = normalize_profile_url(match_str)
-        if canon:
-            start, end = m.span()
-            result = result[:start] + canon + result[end:]
-    return result
-
-
-def _split_tiktok_profiles(cell: Any) -> List[str]:
-    """
-    Split profile cell that may contain multiple values into URL/@username tokens.
-    """
-    # Backward-compat wrapper.
-    return extract_profile_tokens(cell)
-
-
-def canonical_primary_tiktok_profile(cell: Any) -> Optional[str]:
-    """Backward-compat wrapper returning TikTok canonical URL when possible."""
-    ident = pick_primary_profile_identity(cell)
-    if not ident:
-        return None
-    if ident.get("platform") == "tiktok":
-        return ident.get("canonical_url")
-    return None
-
-
 def normalize_song_title(value: Any) -> str:
     """
     Conservative Song Title normalization:
@@ -591,6 +552,42 @@ def _get_sheet_id_by_tab_name(
             return s["properties"].get("sheetId")
     return None
 
+
+def _cleanup_temp_build_tabs(
+    service,
+    spreadsheet_id: str,
+    stats: Dict[str, Any],
+    prefixes: Optional[List[str]] = None,
+    exclude_sheet_ids: Optional[Set[int]] = None,
+) -> int:
+    """
+    Delete temporary build tabs by title prefix.
+    Returns number of deleted tabs.
+    """
+    prefixes = prefixes or ["__monthly_build_", "__weekly_build_"]
+    exclude_sheet_ids = exclude_sheet_ids or set()
+
+    meta = _sheets_get_metadata(service, spreadsheet_id, stats)
+    if not meta:
+        return 0
+
+    delete_ids: List[int] = []
+    for s in meta.get("sheets", []):
+        props = s.get("properties", {})
+        sid = props.get("sheetId")
+        title = str(props.get("title", ""))
+        if sid in exclude_sheet_ids:
+            continue
+        if any(title.startswith(p) for p in prefixes):
+            delete_ids.append(sid)
+
+    if not delete_ids:
+        return 0
+
+    reqs = [{"deleteSheet": {"sheetId": sid}} for sid in delete_ids]
+    out = _sheets_batch_update_safe(service, spreadsheet_id, reqs, stats)
+    return len(delete_ids) if out is not None else 0
+
 # =============================================================================
 # PARSING / DATA PREP
 # =============================================================================
@@ -647,6 +644,16 @@ def _parse_payment_date(value: Any) -> Optional[datetime]:
 
 def _month_key(dt: datetime) -> str:
     return dt.strftime("%B %Y")
+
+
+def _week_start_monday(dt: datetime) -> datetime:
+    base = datetime(dt.year, dt.month, dt.day)
+    return base - timedelta(days=base.weekday())
+
+
+def _week_key(dt: datetime) -> str:
+    _, iso_week, _ = dt.isocalendar()
+    return f"W{iso_week:02d} {dt.strftime('%B %Y')}"
 
 
 def ensure_debug_dir(run_id: str) -> Path:
@@ -742,6 +749,9 @@ def _debug_rows_projection(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "fallback_month_source": r.get("fallback_month_source"),
                 "month_key": r.get("month_key"),
                 "month_source": r.get("month_source"),
+                "week_key": r.get("week_key"),
+                "week_source": r.get("week_source"),
+                "week_start_dt": r.get("week_start_dt"),
                 "requested_by": r.get("requested_by"),
                 "profile_platform": r.get("profile_platform"),
                 "profile_key": r.get("profile_key"),
@@ -798,6 +808,11 @@ def _first_day_of_current_month(now: Optional[datetime] = None) -> datetime:
     return datetime(base.year, base.month, 1)
 
 
+def _first_day_of_current_week_monday(now: Optional[datetime] = None) -> datetime:
+    base = now or datetime.now()
+    return _week_start_monday(base)
+
+
 def month_distribution(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     """Return month label to count mapping for diagnostics."""
     counter = Counter()
@@ -807,6 +822,25 @@ def month_distribution(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         sorted(
             counter.items(),
             key=lambda kv: datetime.strptime(kv[0], "%B %Y"),
+            reverse=True,
+        )
+    )
+
+
+def week_distribution(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    counter = Counter()
+    week_to_dt: Dict[str, datetime] = {}
+    for r in rows:
+        wk = r.get("week_key", "")
+        wdt = r.get("week_start_dt")
+        if not wk or not isinstance(wdt, datetime):
+            continue
+        counter[wk] += 1
+        week_to_dt.setdefault(wk, wdt)
+    return dict(
+        sorted(
+            counter.items(),
+            key=lambda kv: week_to_dt.get(kv[0], datetime.min),
             reverse=True,
         )
     )
@@ -878,6 +912,100 @@ def recompute_month_fields(
         rebuilt.append(r)
 
     return rebuilt, counters
+
+
+def resolve_row_week(
+    payment_date_cell: Any,
+    tab_name: str,
+) -> Tuple[Optional[datetime], str, str]:
+    """
+    Resolve row week with priority:
+    1) Payment date week if parseable
+    2) Tab month fallback mapped from month day 1 to ISO week
+
+    Returns:
+      (week_start_dt, week_key, source)
+      source in {'payment_date', 'tab_month_fallback', 'none'}
+    """
+    payment_dt = _parse_payment_date(payment_date_cell)
+    if payment_dt:
+        week_start = _week_start_monday(payment_dt)
+        return week_start, _week_key(week_start), "payment_date"
+
+    tab_month_dt = parse_tab_month(tab_name)
+    if tab_month_dt:
+        synthetic_dt = datetime(tab_month_dt.year, tab_month_dt.month, 1)
+        week_start = _week_start_monday(synthetic_dt)
+        return week_start, _week_key(week_start), "tab_month_fallback"
+
+    return None, "", "none"
+
+
+def enrich_rows_with_week_fields(
+    rows: List[Dict[str, Any]],
+    stats: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        week_start_dt, week_key, week_source = resolve_row_week(
+            row.get("payment_date_raw"),
+            row.get("tab_name", ""),
+        )
+        if week_source == "payment_date":
+            stats["rows_with_week_from_payment_date"] += 1
+        elif week_source == "tab_month_fallback":
+            stats["rows_with_week_from_tab_month_fallback"] += 1
+        else:
+            stats["rows_dropped_no_usable_week"] += 1
+            continue
+
+        r = dict(row)
+        r["week_start_dt"] = week_start_dt
+        r["week_key"] = week_key
+        r["week_source"] = week_source
+        out.append(r)
+    return out
+
+
+def filter_finished_week_rows(
+    rows: List[Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> Tuple[List[Dict[str, Any]], int, List[str], List[str]]:
+    """
+    Keep only rows from finished weeks (week_start_dt < current week Monday).
+    Returns (filtered_rows, dropped_count, included_weeks_desc, excluded_weeks_desc).
+    """
+    current_week_start = _first_day_of_current_week_monday(now)
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    included_weeks: Set[str] = set()
+    excluded_weeks: Set[str] = set()
+    week_to_dt: Dict[str, datetime] = {}
+
+    for row in rows:
+        week_start = row.get("week_start_dt")
+        week_key = row.get("week_key", "")
+        if not isinstance(week_start, datetime) or not week_key:
+            dropped += 1
+            excluded_weeks.add(week_key or "unknown")
+            continue
+
+        week_to_dt.setdefault(week_key, week_start)
+        if week_start < current_week_start:
+            kept.append(row)
+            included_weeks.add(week_key)
+        else:
+            dropped += 1
+            excluded_weeks.add(week_key)
+
+    def _week_sort_desc(weeks: Set[str]) -> List[str]:
+        return sorted(
+            weeks,
+            key=lambda w: week_to_dt.get(w, datetime.min),
+            reverse=True,
+        )
+
+    return kept, dropped, _week_sort_desc(included_weeks), _week_sort_desc(excluded_weeks)
 
 
 def _has_consecutive_run(nums: List[int], run_len: int = 3) -> bool:
@@ -1113,6 +1241,25 @@ def build_first_paid_dictionaries(
     return first_paid_date_by_profile, first_paid_month_by_profile, first_paid_owner_by_profile
 
 
+def build_first_paid_week_by_profile(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Build first-paid week dictionary by final canonical profile key.
+    Tie-breaker for same profile/date uses first (tab_order, source_row_number).
+    """
+    first_seen: Dict[str, Tuple[datetime, int, int]] = {}
+    for r in rows:
+        profile = r.get("profile_key_final") or r.get("profile_key") or ""
+        week_start = r.get("week_start_dt")
+        if not profile or not isinstance(week_start, datetime):
+            continue
+        tord = r["tab_order"]
+        srow = r["source_row_number"]
+        existing = first_seen.get(profile)
+        if existing is None or (week_start, tord, srow) < existing:
+            first_seen[profile] = (week_start, tord, srow)
+    return {k: _week_key(v[0]) for k, v in first_seen.items()}
+
+
 def aggregate_monthly_metrics(
     rows: List[Dict[str, Any]],
     first_paid_month_by_profile: Dict[str, str],
@@ -1183,8 +1330,74 @@ def aggregate_monthly_metrics(
     return out_rows, months_sorted
 
 
-def _to_int_if_whole(v: float) -> Any:
-    return int(v) if isinstance(v, float) and v.is_integer() else v
+def aggregate_weekly_metrics(
+    rows: List[Dict[str, Any]],
+    first_paid_week_by_profile: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Aggregate metrics by (week_key, requested_by).
+    Returns sorted member rows and sorted week order labels.
+    """
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    week_to_dt: Dict[str, datetime] = {}
+
+    for r in rows:
+        week_key = r["week_key"]
+        member = r["requested_by"]
+        key = (week_key, member)
+        if key not in groups:
+            groups[key] = {
+                "Week": week_key,
+                "Member": member,
+                "_songs": set(),
+                "_profiles": set(),
+                "_rows": 0,
+                "_videos_sum": 0.0,
+                "_spent_sum": 0.0,
+            }
+        g = groups[key]
+        song_key = r["song_title_norm"]
+        if song_key:
+            g["_songs"].add(song_key)
+        profile_key = r.get("profile_key_final") or r.get("profile_key") or ""
+        if profile_key:
+            g["_profiles"].add(profile_key)
+        g["_rows"] += 1
+        g["_videos_sum"] += float(r["videos_posted_num"] or 0.0)
+        g["_spent_sum"] += float(r["total_spent_num"] or 0.0)
+        week_to_dt.setdefault(week_key, r["week_start_dt"])
+
+    out_rows: List[Dict[str, Any]] = []
+    for (week_key, member), g in groups.items():
+        unique_profiles = g["_profiles"]
+        unique_pages_count = len(unique_profiles)
+        videos = g["_videos_sum"]
+        spent = g["_spent_sum"]
+        new_unique = {
+            p for p in unique_profiles if first_paid_week_by_profile.get(p) == week_key
+        }
+        out_rows.append(
+            {
+                "Week": week_key,
+                "Member": member,
+                "# of Songs": len(g["_songs"]),
+                "# of pages commissioned": g["_rows"],
+                "# of UNIQUE pages commissioned": unique_pages_count,
+                "# of NEW UNIQUE pages commissioned": len(new_unique),
+                "# of Videos Posted": videos,
+                "Average videos per editor": (videos / unique_pages_count) if unique_pages_count else 0.0,
+                "Total Spent": spent,
+                "Average cost per video": (spent / videos) if videos else 0.0,
+            }
+        )
+
+    weeks_sorted = [
+        w for w, _ in sorted(week_to_dt.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
+    week_pos = {w: i for i, w in enumerate(weeks_sorted)}
+    out_rows.sort(key=lambda r: (week_pos[r["Week"]], r["Member"].casefold()))
+    return out_rows, weeks_sorted
 
 
 def _to_int_rounded(v: Any) -> int:
@@ -1216,7 +1429,7 @@ def build_output_values(
         header_rows.append(1)
         return [OUTPUT_HEADERS, ["No finished months to report.", "", "", "", "", "", "", "", "", ""]], header_rows, total_rows, block_ranges
 
-    for month in months_sorted:
+    for idx, month in enumerate(months_sorted):
         members = sorted(by_month.get(month, []), key=lambda r: r["Member"].casefold())
         if not members:
             continue
@@ -1247,7 +1460,66 @@ def build_output_values(
         values.append([month, "TOTAL", "", "", "", "", "", "", month_spent_total, ""])
         block_end = len(values)
         block_ranges.append((block_start, block_end))
-        values.append([""] * len(OUTPUT_HEADERS))
+        if idx < len(months_sorted) - 1:
+            values.append([""] * len(OUTPUT_HEADERS))
+
+    return values, header_rows, total_rows, block_ranges
+
+
+def build_weekly_output_values(
+    aggregated_rows: List[Dict[str, Any]],
+    weeks_sorted: List[str],
+) -> Tuple[List[List[Any]], List[int], List[int], List[Tuple[int, int]]]:
+    """
+    Build weekly table blocks with separators.
+    Returns (values, header_rows_1based, total_rows_1based, block_ranges_1based).
+    """
+    by_week: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in aggregated_rows:
+        by_week[r["Week"]].append(r)
+
+    values: List[List[Any]] = []
+    header_rows: List[int] = []
+    total_rows: List[int] = []
+    block_ranges: List[Tuple[int, int]] = []
+
+    if not weeks_sorted:
+        header_rows.append(1)
+        return [WEEKLY_OUTPUT_HEADERS, ["No finished weeks to report.", "", "", "", "", "", "", "", "", ""]], header_rows, total_rows, block_ranges
+
+    for idx, week in enumerate(weeks_sorted):
+        members = sorted(by_week.get(week, []), key=lambda r: r["Member"].casefold())
+        if not members:
+            continue
+
+        block_start = len(values) + 1
+        header_rows.append(len(values) + 1)
+        values.append(WEEKLY_OUTPUT_HEADERS)
+
+        week_spent_total = 0.0
+        for r in members:
+            week_spent_total += float(r["Total Spent"] or 0.0)
+            values.append(
+                [
+                    r["Week"],
+                    r["Member"],
+                    _to_int_rounded(r["# of Songs"]),
+                    _to_int_rounded(r["# of pages commissioned"]),
+                    _to_int_rounded(r["# of UNIQUE pages commissioned"]),
+                    _to_int_rounded(r["# of NEW UNIQUE pages commissioned"]),
+                    _to_int_rounded(r["# of Videos Posted"]),
+                    float(r["Average videos per editor"]),
+                    float(r["Total Spent"]),
+                    float(r["Average cost per video"]),
+                ]
+            )
+
+        total_rows.append(len(values) + 1)
+        values.append([week, "TOTAL", "", "", "", "", "", "", week_spent_total, ""])
+        block_end = len(values)
+        block_ranges.append((block_start, block_end))
+        if idx < len(weeks_sorted) - 1:
+            values.append([""] * len(WEEKLY_OUTPUT_HEADERS))
 
     return values, header_rows, total_rows, block_ranges
 
@@ -1270,10 +1542,53 @@ def _build_format_requests(
     header_rows_1based: List[int],
     total_rows_1based: List[int],
     block_ranges_1based: List[Tuple[int, int]],
+    separator_rows_1based: Optional[List[int]] = None,
+    col_count: int = 10,
 ) -> List[Dict[str, Any]]:
     reqs: List[Dict[str, Any]] = []
+    separator_rows_1based = separator_rows_1based or []
 
     if row_count > 0:
+        reqs.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": row_count,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 2,
+                    },
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT", "pattern": "@"}}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        )
+        reqs.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": row_count,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": col_count,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {"fontFamily": "Roboto"},
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat.textFormat.fontFamily,"
+                        "userEnteredFormat.horizontalAlignment,"
+                        "userEnteredFormat.verticalAlignment"
+                    ),
+                }
+            }
+        )
         reqs.append(
             {
                 "repeatCell": {
@@ -1329,7 +1644,7 @@ def _build_format_requests(
                         "startRowIndex": r - 1,
                         "endRowIndex": r,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 10,
+                        "endColumnIndex": col_count,
                     },
                     "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                     "fields": "userEnteredFormat.textFormat.bold",
@@ -1346,7 +1661,7 @@ def _build_format_requests(
                         "startRowIndex": r - 1,
                         "endRowIndex": r,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 10,
+                        "endColumnIndex": col_count,
                     },
                     "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                     "fields": "userEnteredFormat.textFormat.bold",
@@ -1354,7 +1669,60 @@ def _build_format_requests(
             }
         )
 
-    # Draw borders + banded table style for each month block.
+    # Row heights: normal rows = 30, header/total/separator rows = 35.
+    if row_count > 0:
+        reqs.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": 0,
+                        "endIndex": row_count,
+                    },
+                    "properties": {"pixelSize": 30},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+        special_rows = sorted(set((header_rows_1based or []) + (total_rows_1based or []) + separator_rows_1based))
+        for r in special_rows:
+            if 1 <= r <= row_count:
+                reqs.append(
+                    {
+                        "updateDimensionProperties": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": r - 1,
+                                "endIndex": r,
+                            },
+                            "properties": {"pixelSize": 35},
+                            "fields": "pixelSize",
+                        }
+                    }
+                )
+
+    # Separator rows: black background.
+    for r in separator_rows_1based:
+        if 1 <= r <= row_count:
+            reqs.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": r - 1,
+                            "endRowIndex": r,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": col_count,
+                        },
+                        "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0, "green": 0, "blue": 0}}},
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                }
+            )
+
+    # Draw borders + banding for each block.
     for start_row, end_row in block_ranges_1based:
         reqs.append(
             {
@@ -1364,7 +1732,7 @@ def _build_format_requests(
                         "startRowIndex": start_row - 1,
                         "endRowIndex": end_row,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 10,
+                        "endColumnIndex": col_count,
                     },
                     "top": {"style": "SOLID", "width": 1},
                     "bottom": {"style": "SOLID", "width": 1},
@@ -1384,7 +1752,7 @@ def _build_format_requests(
                             "startRowIndex": start_row - 1,
                             "endRowIndex": end_row,
                             "startColumnIndex": 0,
-                            "endColumnIndex": 10,
+                            "endColumnIndex": col_count,
                         },
                         "rowProperties": {
                             "headerColor": {"red": 0.86, "green": 0.92, "blue": 0.98},
@@ -1403,12 +1771,256 @@ def _build_format_requests(
                     "sheetId": sheet_id,
                     "dimension": "COLUMNS",
                     "startIndex": 0,
-                    "endIndex": 10,
+                    "endIndex": col_count,
                 }
             }
         }
     )
     return reqs
+
+
+def _hls_color(hue_deg: float, lightness: float = 0.70, saturation: float = 0.48) -> Dict[str, float]:
+    h = (hue_deg % 360.0) / 360.0
+    r, g, b = colorsys.hls_to_rgb(h, lightness, saturation)
+    return {"red": r, "green": g, "blue": b}
+
+
+def _build_conditional_color_requests(
+    sheet_id: int,
+    values: List[List[Any]],
+    row_count: int,
+    col_count: int,
+) -> List[Dict[str, Any]]:
+    """
+    Color-code Month/Week (col A) and Member (col B) labels via conditional rules.
+    """
+    reqs: List[Dict[str, Any]] = []
+    if row_count <= 1 or col_count < 2:
+        return reqs
+
+    first_col_labels: Set[str] = set()
+    members: Set[str] = set()
+    for row in values:
+        c0 = str(row[0]).strip() if len(row) > 0 else ""
+        c1 = str(row[1]).strip() if len(row) > 1 else ""
+        if c0 and c0 not in {"Month", "Week", "No finished months to report.", "No finished weeks to report."}:
+            first_col_labels.add(c0)
+        if c1 and c1 not in {"Member", "TOTAL"}:
+            members.add(c1)
+
+    def _text_rule(range_col_idx: int, text: str, color: Dict[str, float]) -> Dict[str, Any]:
+        return {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [
+                        {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": row_count,
+                            "startColumnIndex": range_col_idx,
+                            "endColumnIndex": range_col_idx + 1,
+                        }
+                    ],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "TEXT_EQ",
+                            "values": [{"userEnteredValue": text}],
+                        },
+                        "format": {"backgroundColor": color},
+                    },
+                },
+                "index": 0,
+            }
+        }
+
+    month_name_to_num = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+    month_hues = {
+        1: 16, 2: 36, 3: 56, 4: 76, 5: 96, 6: 126,
+        7: 156, 8: 186, 9: 216, 10: 246, 11: 276, 12: 306,
+    }
+    week_rank_hues = {
+        1: 28, 2: 58, 3: 98, 4: 138, 5: 188, 6: 228,
+    }
+
+    # Period colors:
+    # - Monthly tabs: same month-of-year color across all years.
+    # - Weekly tabs: same week-rank-within-month color across all months/years.
+    weekly_labels: List[Tuple[str, int, str, int]] = []
+    monthly_labels: List[Tuple[str, int, int]] = []
+    for label in first_col_labels:
+        mw = re.match(r"^W(\d{2})\s+([A-Za-z]+)\s+(\d{4})$", label)
+        if mw:
+            week_num = int(mw.group(1))
+            mon_name = mw.group(2)
+            year = int(mw.group(3))
+            weekly_labels.append((label, week_num, mon_name, year))
+            continue
+        mm = re.match(r"^([A-Za-z]+)\s+(\d{4})$", label)
+        if mm:
+            mon_name = mm.group(1)
+            year = int(mm.group(2))
+            mon_num = month_name_to_num.get(mon_name.casefold(), 0)
+            if mon_num:
+                monthly_labels.append((label, mon_num, year))
+
+    for label, mon_num, _year in sorted(monthly_labels, key=lambda x: (x[2], x[1])):
+        hue = month_hues.get(mon_num, 200.0)
+        reqs.append(_text_rule(0, label, _hls_color(hue, lightness=0.70, saturation=0.48)))
+
+    # Build month-year -> ordered week list, then assign rank colors (1st/2nd/... week of month).
+    monthyear_weeks: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    parsed_weekly: List[Tuple[str, int, int, int]] = []  # (label, week_num, mon_num, year)
+    for label, week_num, mon_name, year in weekly_labels:
+        mon_num = month_name_to_num.get(mon_name.casefold(), 0)
+        if not mon_num:
+            continue
+        monthyear_weeks[(year, mon_num)].append(week_num)
+        parsed_weekly.append((label, week_num, mon_num, year))
+
+    week_rank_by_label: Dict[str, int] = {}
+    for (year, mon_num), weeks in monthyear_weeks.items():
+        ordered = sorted(set(weeks))
+        for idx, wk in enumerate(ordered, start=1):
+            for label, week_num, mnum, y in parsed_weekly:
+                if y == year and mnum == mon_num and week_num == wk:
+                    week_rank_by_label[label] = idx
+
+    for label, _week_num, _mon_num, _year in sorted(parsed_weekly, key=lambda x: (x[3], x[2], x[1])):
+        rank = week_rank_by_label.get(label, 1)
+        hue = week_rank_hues.get(rank, (28 + ((rank - 1) * 34)) % 360)
+        reqs.append(_text_rule(0, label, _hls_color(hue, lightness=0.69, saturation=0.46)))
+
+    # Member colors: deterministic, non-repeating by construction in this run.
+    # Colors are assigned by sorted member order using a golden-angle hue sequence.
+    members_sorted = sorted(members, key=lambda s: s.casefold())
+    for idx, member in enumerate(members_sorted):
+        hue = (idx * 137.50776405) % 360.0
+        lightness = 0.70 - (0.04 if (idx % 3 == 1) else (0.02 if (idx % 3 == 2) else 0.0))
+        saturation = 0.50 - (0.03 if (idx % 2 == 1) else 0.0)
+        reqs.append(_text_rule(1, member, _hls_color(hue, lightness=lightness, saturation=saturation)))
+
+    return reqs
+
+
+def rebuild_period_tab(
+    service,
+    spreadsheet_id: str,
+    dest_tab_name: str,
+    temp_title_prefix: str,
+    values: List[List[Any]],
+    header_rows_1based: List[int],
+    total_rows_1based: List[int],
+    block_ranges_1based: List[Tuple[int, int]],
+    output_headers: List[str],
+    stats: Dict[str, Any],
+) -> None:
+    """Create temp tab, write/format, delete old destination, rename temp to destination."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_title = f"{temp_title_prefix}_{ts}"
+    row_count = max(1, len(values))
+    col_count = max(1, len(output_headers))
+    temp_sheet_id: Optional[int] = None
+
+    try:
+        separator_rows_1based = [
+            i + 1
+            for i, row in enumerate(values)
+            if len(row) == col_count and all(str(cell).strip() == "" for cell in row)
+        ]
+
+        add_req = {
+            "addSheet": {
+                "properties": {
+                    "title": temp_title,
+                    "gridProperties": {"rowCount": row_count, "columnCount": col_count},
+                }
+            }
+        }
+        add_resp = _sheets_batch_update_safe(service, spreadsheet_id, [add_req], stats)
+        if not add_resp:
+            raise RuntimeError("Failed to create temporary destination tab.")
+
+        replies = add_resp.get("replies", [])
+        if not replies or "addSheet" not in replies[0]:
+            raise RuntimeError("Unexpected addSheet response; could not resolve temp sheet ID.")
+        temp_sheet_id = replies[0]["addSheet"]["properties"]["sheetId"]
+
+        last_col = _column_to_a1(len(output_headers))
+        last_row = max(1, len(values))
+        range_name = f"'{temp_title}'!A1:{last_col}{last_row}"
+        if not _sheets_update_values_safe(
+            service,
+            spreadsheet_id,
+            range_name,
+            values,
+            stats,
+            value_input_option="RAW",
+        ):
+            raise RuntimeError("Failed to write data to temporary destination tab.")
+
+        fmt_requests = _build_format_requests(
+            sheet_id=temp_sheet_id,
+            row_count=len(values),
+            header_rows_1based=header_rows_1based,
+            total_rows_1based=total_rows_1based,
+            block_ranges_1based=block_ranges_1based,
+            separator_rows_1based=separator_rows_1based,
+            col_count=col_count,
+        )
+        if _sheets_batch_update_safe(service, spreadsheet_id, fmt_requests, stats) is None:
+            raise RuntimeError("Failed to format temporary destination tab.")
+
+        color_requests = _build_conditional_color_requests(
+            sheet_id=temp_sheet_id,
+            values=values,
+            row_count=len(values),
+            col_count=col_count,
+        )
+        if color_requests and _sheets_batch_update_safe(service, spreadsheet_id, color_requests, stats) is None:
+            raise RuntimeError("Failed to apply color-coding rules on temporary destination tab.")
+
+        old_sheet_id = _get_sheet_id_by_tab_name(service, spreadsheet_id, dest_tab_name, stats)
+        finalize_reqs: List[Dict[str, Any]] = []
+        if old_sheet_id is not None:
+            finalize_reqs.append({"deleteSheet": {"sheetId": old_sheet_id}})
+        finalize_reqs.append(
+            {
+                "updateSheetProperties": {
+                    "properties": {"sheetId": temp_sheet_id, "title": dest_tab_name},
+                    "fields": "title",
+                }
+            }
+        )
+        if _sheets_batch_update_safe(service, spreadsheet_id, finalize_reqs, stats) is None:
+            raise RuntimeError(f"Failed to rotate destination {dest_tab_name} tab (delete/rename).")
+
+        # Run a final autosize after rotation to guarantee fit on the destination tab.
+        final_autosize_req = [
+            {
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": temp_sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": col_count,
+                    }
+                }
+            }
+        ]
+        if _sheets_batch_update_safe(service, spreadsheet_id, final_autosize_req, stats) is None:
+            raise RuntimeError(f"Failed to auto-size destination {dest_tab_name} columns.")
+    except Exception:
+        if temp_sheet_id is not None:
+            _sheets_batch_update_safe(
+                service,
+                spreadsheet_id,
+                [{"deleteSheet": {"sheetId": temp_sheet_id}}],
+                stats,
+            )
+        raise
 
 
 def rebuild_monthly_tab(
@@ -1420,59 +2032,41 @@ def rebuild_monthly_tab(
     block_ranges_1based: List[Tuple[int, int]],
     stats: Dict[str, Any],
 ) -> None:
-    """Create temp tab, write/format, delete old Monthly, rename temp to Monthly."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    temp_title = f"__monthly_build_{ts}"
-    row_count = max(100, len(values) + 10)
-    col_count = max(10, len(OUTPUT_HEADERS))
-
-    add_req = {
-        "addSheet": {
-            "properties": {
-                "title": temp_title,
-                "gridProperties": {"rowCount": row_count, "columnCount": col_count},
-            }
-        }
-    }
-    add_resp = _sheets_batch_update_safe(service, spreadsheet_id, [add_req], stats)
-    if not add_resp:
-        raise RuntimeError("Failed to create temporary destination tab.")
-
-    replies = add_resp.get("replies", [])
-    if not replies or "addSheet" not in replies[0]:
-        raise RuntimeError("Unexpected addSheet response; could not resolve temp sheet ID.")
-    temp_sheet_id = replies[0]["addSheet"]["properties"]["sheetId"]
-
-    last_col = _column_to_a1(len(OUTPUT_HEADERS))
-    last_row = max(1, len(values))
-    range_name = f"'{temp_title}'!A1:{last_col}{last_row}"
-    if not _sheets_update_values_safe(service, spreadsheet_id, range_name, values, stats):
-        raise RuntimeError("Failed to write data to temporary destination tab.")
-
-    fmt_requests = _build_format_requests(
-        sheet_id=temp_sheet_id,
-        row_count=len(values),
+    rebuild_period_tab(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        dest_tab_name=DEST_MONTHLY_TAB_NAME,
+        temp_title_prefix="__monthly_build",
+        values=values,
         header_rows_1based=header_rows_1based,
         total_rows_1based=total_rows_1based,
         block_ranges_1based=block_ranges_1based,
+        output_headers=OUTPUT_HEADERS,
+        stats=stats,
     )
-    if _sheets_batch_update_safe(service, spreadsheet_id, fmt_requests, stats) is None:
-        raise RuntimeError("Failed to format temporary destination tab.")
 
-    old_monthly_sheet_id = _get_sheet_id_by_tab_name(service, spreadsheet_id, DEST_MONTHLY_TAB_NAME, stats)
-    finalize_reqs: List[Dict[str, Any]] = []
-    if old_monthly_sheet_id is not None:
-        finalize_reqs.append({"deleteSheet": {"sheetId": old_monthly_sheet_id}})
-    finalize_reqs.append(
-        {
-            "updateSheetProperties": {
-                "properties": {"sheetId": temp_sheet_id, "title": DEST_MONTHLY_TAB_NAME},
-                "fields": "title",
-            }
-        }
+
+def rebuild_weekly_tab(
+    service,
+    spreadsheet_id: str,
+    values: List[List[Any]],
+    header_rows_1based: List[int],
+    total_rows_1based: List[int],
+    block_ranges_1based: List[Tuple[int, int]],
+    stats: Dict[str, Any],
+) -> None:
+    rebuild_period_tab(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        dest_tab_name=DEST_WEEKLY_TAB_NAME,
+        temp_title_prefix="__weekly_build",
+        values=values,
+        header_rows_1based=header_rows_1based,
+        total_rows_1based=total_rows_1based,
+        block_ranges_1based=block_ranges_1based,
+        output_headers=WEEKLY_OUTPUT_HEADERS,
+        stats=stats,
     )
-    if _sheets_batch_update_safe(service, spreadsheet_id, finalize_reqs, stats) is None:
-        raise RuntimeError("Failed to rotate destination Monthly tab (delete/rename).")
 
 
 # =============================================================================
@@ -1500,11 +2094,18 @@ def main() -> Dict[str, Any]:
         "months_detected_before_filter": 0,
         "months_after_finished_filter": 0,
         "rows_dropped_current_month": 0,
+        "weeks_detected_before_filter": 0,
+        "weeks_after_finished_filter": 0,
+        "rows_dropped_current_week": 0,
         "rows_with_valid_payment_date": 0,
         "rows_with_tab_month_fallback": 0,
+        "rows_with_week_from_payment_date": 0,
+        "rows_with_week_from_tab_month_fallback": 0,
         "rows_with_date_tab_mismatch": 0,
         "rows_dropped_no_usable_month": 0,
+        "rows_dropped_no_usable_week": 0,
         "finished_filter_cutoff_month": "",
+        "finished_filter_cutoff_week": "",
         "rows_with_url_profile": 0,
         "rows_with_text_profile": 0,
         "platform_counts": {},
@@ -1535,7 +2136,15 @@ def main() -> Dict[str, Any]:
         print("\n" + "-" * 72)
         print("  STEP 2: Load and normalize PAID rows from all source tabs")
         print("-" * 72)
+        cleaned = _cleanup_temp_build_tabs(
+            service=service,
+            spreadsheet_id=DEST_SPREADSHEET_ID,
+            stats=stats,
+        )
+        if cleaned:
+            print(f"  Cleanup: deleted {cleaned} stale build tabs from destination.")
         rows, dropped = load_all_tabs_paid_rows(service, SOURCE_SPREADSHEET_ID, stats)
+        rows_all_normalized = list(rows)
         print(f"  Tabs scanned: {stats['tabs_scanned']}")
         print(f"  Rows read: {stats['rows_read']}")
         print(f"  Rows kept (PAID + valid): {stats['rows_kept']}")
@@ -1744,6 +2353,99 @@ def main() -> Dict[str, Any]:
         )
         print("  Destination tab rotation completed successfully.")
 
+        print("\n" + "-" * 72)
+        print("  STEP 8: Build weekly rows and keep finished weeks")
+        print("-" * 72)
+        weekly_rows = enrich_rows_with_week_fields(rows_all_normalized, stats)
+        weeks_before_map = week_distribution(weekly_rows)
+        stats["weeks_detected_before_filter"] = len(weeks_before_map)
+        cutoff_week_dt = _first_day_of_current_week_monday()
+        stats["finished_filter_cutoff_week"] = _week_key(cutoff_week_dt)
+        print(f"  Weekly rows with usable period: {len(weekly_rows)}")
+        print(f"  Finished-week cutoff: {stats['finished_filter_cutoff_week']} (excluded and newer)")
+        print(f"  rows_with_week_from_payment_date: {stats['rows_with_week_from_payment_date']}")
+        print(f"  rows_with_week_from_tab_month_fallback: {stats['rows_with_week_from_tab_month_fallback']}")
+        print(f"  rows_dropped_no_usable_week: {stats['rows_dropped_no_usable_week']}")
+        if weeks_before_map:
+            print("  Week distribution before finished-week filter:")
+            for w, c in weeks_before_map.items():
+                print(f"    - {w}: {c}")
+        if WRITE_DEBUG_ARTIFACTS and debug_dir:
+            write_debug_json(debug_dir / "week_counts_before_filter.json", weeks_before_map)
+
+        weekly_rows_merged, weekly_alias_map, weekly_merge_stats = apply_conservative_drag_merge(weekly_rows)
+        print(f"  Weekly drag merge groups: {weekly_merge_stats.get('drag_merge_groups', 0)}")
+        print(f"  Weekly drag merge aliases applied: {weekly_merge_stats.get('drag_merge_aliases_applied', 0)}")
+        if WRITE_DEBUG_ARTIFACTS and debug_dir:
+            write_debug_json(debug_dir / "weekly_drag_merge_alias_map.json", weekly_alias_map)
+
+        weekly_rows_finished, weekly_dropped_current, included_weeks, excluded_weeks = filter_finished_week_rows(
+            weekly_rows_merged
+        )
+        stats["rows_dropped_current_week"] = weekly_dropped_current
+        stats["weeks_after_finished_filter"] = len(included_weeks)
+        print(f"  Weekly rows kept after finished-week filter: {len(weekly_rows_finished)}")
+        print(f"  Weekly rows dropped as current/future week: {weekly_dropped_current}")
+        if included_weeks:
+            print(f"  Included weeks (newest->oldest): {included_weeks}")
+        if excluded_weeks:
+            print(f"  Excluded weeks (current/future): {excluded_weeks}")
+
+        weeks_after_map = week_distribution(weekly_rows_finished)
+        if weeks_after_map:
+            print("  Week distribution after finished-week filter:")
+            for w, c in weeks_after_map.items():
+                print(f"    - {w}: {c}")
+        if WRITE_DEBUG_ARTIFACTS and debug_dir:
+            write_debug_csv(
+                debug_dir / "04_rows_after_week_filter.csv",
+                _debug_rows_projection(weekly_rows_finished),
+                DEBUG_CSV_FIELDS,
+            )
+            write_debug_json(debug_dir / "week_counts_after_filter.json", weeks_after_map)
+
+        print("\n" + "-" * 72)
+        print("  STEP 9: Aggregate by week/member")
+        print("-" * 72)
+        first_paid_week_by_profile = build_first_paid_week_by_profile(weekly_rows_merged)
+        weekly_aggregated_rows, weeks_sorted = aggregate_weekly_metrics(
+            weekly_rows_finished,
+            first_paid_week_by_profile,
+        )
+        stats["week_blocks_written"] = len(weeks_sorted)
+        stats["weekly_member_rows_written"] = len(weekly_aggregated_rows)
+        print(f"  Week blocks: {stats['week_blocks_written']}")
+        if weeks_sorted:
+            print(f"  Weekly block order (newest->oldest): {weeks_sorted}")
+        print(f"  Weekly member rows: {stats['weekly_member_rows_written']}")
+
+        print("\n" + "-" * 72)
+        print("  STEP 10: Build weekly output values")
+        print("-" * 72)
+        weekly_values, weekly_header_rows, weekly_total_rows, weekly_block_ranges = build_weekly_output_values(
+            weekly_aggregated_rows,
+            weeks_sorted,
+        )
+        print(f"  Weekly output rows (including headers/totals/separators): {len(weekly_values)}")
+        print(
+            "  Weekly header rows: "
+            f"{len(weekly_header_rows)} | Weekly total rows: {len(weekly_total_rows)} | Weekly table blocks: {len(weekly_block_ranges)}"
+        )
+
+        print("\n" + "-" * 72)
+        print("  STEP 11: Rebuild destination Weekly tab")
+        print("-" * 72)
+        rebuild_weekly_tab(
+            service=service,
+            spreadsheet_id=DEST_SPREADSHEET_ID,
+            values=weekly_values,
+            header_rows_1based=weekly_header_rows,
+            total_rows_1based=weekly_total_rows,
+            block_ranges_1based=weekly_block_ranges,
+            stats=stats,
+        )
+        print("  Weekly destination tab rotation completed successfully.")
+
         duration = time.perf_counter() - run_start
         stats["duration_seconds"] = round(duration, 2)
         stats["status"] = "success"
@@ -1760,11 +2462,18 @@ def main() -> Dict[str, Any]:
             "months_detected_before_filter",
             "months_after_finished_filter",
             "rows_dropped_current_month",
+            "weeks_detected_before_filter",
+            "weeks_after_finished_filter",
+            "rows_dropped_current_week",
             "rows_with_valid_payment_date",
             "rows_with_tab_month_fallback",
+            "rows_with_week_from_payment_date",
+            "rows_with_week_from_tab_month_fallback",
             "rows_with_date_tab_mismatch",
             "rows_dropped_no_usable_month",
+            "rows_dropped_no_usable_week",
             "finished_filter_cutoff_month",
+            "finished_filter_cutoff_week",
             "rows_with_url_profile",
             "rows_with_text_profile",
             "platform_counts",
@@ -1780,6 +2489,8 @@ def main() -> Dict[str, Any]:
             "unique_profiles",
             "month_blocks_written",
             "member_rows_written",
+            "week_blocks_written",
+            "weekly_member_rows_written",
             "api_failures",
             "duration_seconds",
         ]:
