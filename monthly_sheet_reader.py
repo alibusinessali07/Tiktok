@@ -83,6 +83,8 @@ WEEKLY_OUTPUT_HEADERS = [
     "Average cost per video",
 ]
 
+TOTAL_ROW_LABEL = "Aggregations"
+
 
 # =============================================================================
 # NORMALIZATION HELPERS
@@ -1281,6 +1283,7 @@ def aggregate_monthly_metrics(
                 "Member": member,
                 "_songs": set(),
                 "_profiles": set(),
+                "_profile_info": {},
                 "_rows": 0,
                 "_videos_sum": 0.0,
                 "_spent_sum": 0.0,
@@ -1292,6 +1295,11 @@ def aggregate_monthly_metrics(
         profile_key = r.get("profile_key_final") or r.get("profile_key") or ""
         if profile_key:
             g["_profiles"].add(profile_key)
+            pinfo = g["_profile_info"].setdefault(profile_key, {"name": "", "url": ""})
+            if not pinfo["name"]:
+                pinfo["name"] = str(r.get("profile_canonical_handle") or "").strip()
+            if not pinfo["url"]:
+                pinfo["url"] = str(r.get("profile_canonical_url") or "").strip()
         g["_rows"] += 1
         g["_videos_sum"] += float(r["videos_posted_num"] or 0.0)
         g["_spent_sum"] += float(r["total_spent_num"] or 0.0)
@@ -1306,6 +1314,16 @@ def aggregate_monthly_metrics(
         new_unique = {
             p for p in unique_profiles if first_paid_month_by_profile.get(p) == month_key
         }
+        note_lines: List[str] = []
+        for profile_key in sorted(new_unique, key=lambda s: s.casefold()):
+            pinfo = g["_profile_info"].get(profile_key, {})
+            name = str(pinfo.get("name", "") or "").strip()
+            url = str(pinfo.get("url", "") or "").strip()
+            if not name:
+                name = profile_key.split(":")[-1] if ":" in profile_key else profile_key
+            line = f"{name} - {url}" if url else name
+            if line.strip():
+                note_lines.append(line)
         out_rows.append(
             {
                 "Month": month_key,
@@ -1318,6 +1336,7 @@ def aggregate_monthly_metrics(
                 "Average videos per editor": (videos / unique_pages_count) if unique_pages_count else 0.0,
                 "Total Spent": spent,
                 "Average cost per video": (spent / videos) if videos else 0.0,
+                "_new_unique_pages_note": "\n".join(note_lines),
             }
         )
 
@@ -1351,6 +1370,7 @@ def aggregate_weekly_metrics(
                 "Member": member,
                 "_songs": set(),
                 "_profiles": set(),
+                "_profile_info": {},
                 "_rows": 0,
                 "_videos_sum": 0.0,
                 "_spent_sum": 0.0,
@@ -1362,6 +1382,11 @@ def aggregate_weekly_metrics(
         profile_key = r.get("profile_key_final") or r.get("profile_key") or ""
         if profile_key:
             g["_profiles"].add(profile_key)
+            pinfo = g["_profile_info"].setdefault(profile_key, {"name": "", "url": ""})
+            if not pinfo["name"]:
+                pinfo["name"] = str(r.get("profile_canonical_handle") or "").strip()
+            if not pinfo["url"]:
+                pinfo["url"] = str(r.get("profile_canonical_url") or "").strip()
         g["_rows"] += 1
         g["_videos_sum"] += float(r["videos_posted_num"] or 0.0)
         g["_spent_sum"] += float(r["total_spent_num"] or 0.0)
@@ -1376,6 +1401,16 @@ def aggregate_weekly_metrics(
         new_unique = {
             p for p in unique_profiles if first_paid_week_by_profile.get(p) == week_key
         }
+        note_lines: List[str] = []
+        for profile_key in sorted(new_unique, key=lambda s: s.casefold()):
+            pinfo = g["_profile_info"].get(profile_key, {})
+            name = str(pinfo.get("name", "") or "").strip()
+            url = str(pinfo.get("url", "") or "").strip()
+            if not name:
+                name = profile_key.split(":")[-1] if ":" in profile_key else profile_key
+            line = f"{name} - {url}" if url else name
+            if line.strip():
+                note_lines.append(line)
         out_rows.append(
             {
                 "Week": week_key,
@@ -1388,6 +1423,7 @@ def aggregate_weekly_metrics(
                 "Average videos per editor": (videos / unique_pages_count) if unique_pages_count else 0.0,
                 "Total Spent": spent,
                 "Average cost per video": (spent / videos) if videos else 0.0,
+                "_new_unique_pages_note": "\n".join(note_lines),
             }
         )
 
@@ -1411,10 +1447,10 @@ def _to_int_rounded(v: Any) -> int:
 def build_output_values(
     aggregated_rows: List[Dict[str, Any]],
     months_sorted: List[str],
-) -> Tuple[List[List[Any]], List[int], List[int], List[Tuple[int, int]]]:
+) -> Tuple[List[List[Any]], List[int], List[int], List[Tuple[int, int]], List[Tuple[int, int, str]]]:
     """
     Build monthly table blocks with separators.
-    Returns (values, header_rows_1based, total_rows_1based, block_ranges_1based).
+    Returns (values, header_rows_1based, total_rows_1based, block_ranges_1based, note_cells_1based).
     """
     by_month: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in aggregated_rows:
@@ -1424,10 +1460,17 @@ def build_output_values(
     header_rows: List[int] = []
     total_rows: List[int] = []
     block_ranges: List[Tuple[int, int]] = []
+    note_cells: List[Tuple[int, int, str]] = []
 
     if not months_sorted:
         header_rows.append(1)
-        return [OUTPUT_HEADERS, ["No finished months to report.", "", "", "", "", "", "", "", "", ""]], header_rows, total_rows, block_ranges
+        return (
+            [OUTPUT_HEADERS, ["No finished months to report.", "", "", "", "", "", "", "", "", ""]],
+            header_rows,
+            total_rows,
+            block_ranges,
+            note_cells,
+        )
 
     for idx, month in enumerate(months_sorted):
         members = sorted(by_month.get(month, []), key=lambda r: r["Member"].casefold())
@@ -1438,8 +1481,18 @@ def build_output_values(
         header_rows.append(len(values) + 1)
         values.append(OUTPUT_HEADERS)
 
+        month_songs_total = 0
+        month_pages_commissioned_total = 0
+        month_unique_pages_total = 0
+        month_new_unique_pages_total = 0
+        month_videos_posted_total = 0
         month_spent_total = 0.0
         for r in members:
+            month_songs_total += _to_int_rounded(r["# of Songs"])
+            month_pages_commissioned_total += _to_int_rounded(r["# of pages commissioned"])
+            month_unique_pages_total += _to_int_rounded(r["# of UNIQUE pages commissioned"])
+            month_new_unique_pages_total += _to_int_rounded(r["# of NEW UNIQUE pages commissioned"])
+            month_videos_posted_total += _to_int_rounded(r["# of Videos Posted"])
             month_spent_total += float(r["Total Spent"] or 0.0)
             values.append(
                 [
@@ -1455,24 +1508,46 @@ def build_output_values(
                     float(r["Average cost per video"]),
                 ]
             )
+            note_text = str(r.get("_new_unique_pages_note", "") or "").strip()
+            if note_text:
+                note_cells.append((len(values), 6, note_text))
 
         total_rows.append(len(values) + 1)
-        values.append([month, "TOTAL", "", "", "", "", "", "", month_spent_total, ""])
+        month_avg_videos_per_editor = (
+            month_videos_posted_total / month_unique_pages_total if month_unique_pages_total else 0.0
+        )
+        month_avg_cost_per_video = (
+            month_spent_total / month_videos_posted_total if month_videos_posted_total else 0.0
+        )
+        values.append(
+            [
+                month,
+                TOTAL_ROW_LABEL,
+                month_songs_total,
+                month_pages_commissioned_total,
+                month_unique_pages_total,
+                month_new_unique_pages_total,
+                month_videos_posted_total,
+                month_avg_videos_per_editor,
+                month_spent_total,
+                month_avg_cost_per_video,
+            ]
+        )
         block_end = len(values)
         block_ranges.append((block_start, block_end))
         if idx < len(months_sorted) - 1:
             values.append([""] * len(OUTPUT_HEADERS))
 
-    return values, header_rows, total_rows, block_ranges
+    return values, header_rows, total_rows, block_ranges, note_cells
 
 
 def build_weekly_output_values(
     aggregated_rows: List[Dict[str, Any]],
     weeks_sorted: List[str],
-) -> Tuple[List[List[Any]], List[int], List[int], List[Tuple[int, int]]]:
+) -> Tuple[List[List[Any]], List[int], List[int], List[Tuple[int, int]], List[Tuple[int, int, str]]]:
     """
     Build weekly table blocks with separators.
-    Returns (values, header_rows_1based, total_rows_1based, block_ranges_1based).
+    Returns (values, header_rows_1based, total_rows_1based, block_ranges_1based, note_cells_1based).
     """
     by_week: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in aggregated_rows:
@@ -1482,10 +1557,17 @@ def build_weekly_output_values(
     header_rows: List[int] = []
     total_rows: List[int] = []
     block_ranges: List[Tuple[int, int]] = []
+    note_cells: List[Tuple[int, int, str]] = []
 
     if not weeks_sorted:
         header_rows.append(1)
-        return [WEEKLY_OUTPUT_HEADERS, ["No finished weeks to report.", "", "", "", "", "", "", "", "", ""]], header_rows, total_rows, block_ranges
+        return (
+            [WEEKLY_OUTPUT_HEADERS, ["No finished weeks to report.", "", "", "", "", "", "", "", "", ""]],
+            header_rows,
+            total_rows,
+            block_ranges,
+            note_cells,
+        )
 
     for idx, week in enumerate(weeks_sorted):
         members = sorted(by_week.get(week, []), key=lambda r: r["Member"].casefold())
@@ -1496,8 +1578,18 @@ def build_weekly_output_values(
         header_rows.append(len(values) + 1)
         values.append(WEEKLY_OUTPUT_HEADERS)
 
+        week_songs_total = 0
+        week_pages_commissioned_total = 0
+        week_unique_pages_total = 0
+        week_new_unique_pages_total = 0
+        week_videos_posted_total = 0
         week_spent_total = 0.0
         for r in members:
+            week_songs_total += _to_int_rounded(r["# of Songs"])
+            week_pages_commissioned_total += _to_int_rounded(r["# of pages commissioned"])
+            week_unique_pages_total += _to_int_rounded(r["# of UNIQUE pages commissioned"])
+            week_new_unique_pages_total += _to_int_rounded(r["# of NEW UNIQUE pages commissioned"])
+            week_videos_posted_total += _to_int_rounded(r["# of Videos Posted"])
             week_spent_total += float(r["Total Spent"] or 0.0)
             values.append(
                 [
@@ -1513,15 +1605,37 @@ def build_weekly_output_values(
                     float(r["Average cost per video"]),
                 ]
             )
+            note_text = str(r.get("_new_unique_pages_note", "") or "").strip()
+            if note_text:
+                note_cells.append((len(values), 6, note_text))
 
         total_rows.append(len(values) + 1)
-        values.append([week, "TOTAL", "", "", "", "", "", "", week_spent_total, ""])
+        week_avg_videos_per_editor = (
+            week_videos_posted_total / week_unique_pages_total if week_unique_pages_total else 0.0
+        )
+        week_avg_cost_per_video = (
+            week_spent_total / week_videos_posted_total if week_videos_posted_total else 0.0
+        )
+        values.append(
+            [
+                week,
+                TOTAL_ROW_LABEL,
+                week_songs_total,
+                week_pages_commissioned_total,
+                week_unique_pages_total,
+                week_new_unique_pages_total,
+                week_videos_posted_total,
+                week_avg_videos_per_editor,
+                week_spent_total,
+                week_avg_cost_per_video,
+            ]
+        )
         block_end = len(values)
         block_ranges.append((block_start, block_end))
         if idx < len(weeks_sorted) - 1:
             values.append([""] * len(WEEKLY_OUTPUT_HEADERS))
 
-    return values, header_rows, total_rows, block_ranges
+    return values, header_rows, total_rows, block_ranges, note_cells
 
 # =============================================================================
 # DESTINATION WRITING
@@ -1805,7 +1919,7 @@ def _build_conditional_color_requests(
         c1 = str(row[1]).strip() if len(row) > 1 else ""
         if c0 and c0 not in {"Month", "Week", "No finished months to report.", "No finished weeks to report."}:
             first_col_labels.add(c0)
-        if c1 and c1 not in {"Member", "TOTAL"}:
+        if c1 and c1 not in {"Member", TOTAL_ROW_LABEL}:
             members.add(c1)
 
     def _text_rule(range_col_idx: int, text: str, color: Dict[str, float]) -> Dict[str, Any]:
@@ -1905,6 +2019,34 @@ def _build_conditional_color_requests(
     return reqs
 
 
+def _build_note_requests(
+    sheet_id: int,
+    note_cells_1based: List[Tuple[int, int, str]],
+) -> List[Dict[str, Any]]:
+    """Build batchUpdate requests for cell notes."""
+    reqs: List[Dict[str, Any]] = []
+    for row_1based, col_1based, note_text in note_cells_1based:
+        note = str(note_text or "").strip()
+        if not note:
+            continue
+        reqs.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": row_1based - 1,
+                        "endRowIndex": row_1based,
+                        "startColumnIndex": col_1based - 1,
+                        "endColumnIndex": col_1based,
+                    },
+                    "cell": {"note": note},
+                    "fields": "note",
+                }
+            }
+        )
+    return reqs
+
+
 def rebuild_period_tab(
     service,
     spreadsheet_id: str,
@@ -1914,6 +2056,7 @@ def rebuild_period_tab(
     header_rows_1based: List[int],
     total_rows_1based: List[int],
     block_ranges_1based: List[Tuple[int, int]],
+    note_cells_1based: List[Tuple[int, int, str]],
     output_headers: List[str],
     stats: Dict[str, Any],
 ) -> None:
@@ -1973,6 +2116,13 @@ def rebuild_period_tab(
         if _sheets_batch_update_safe(service, spreadsheet_id, fmt_requests, stats) is None:
             raise RuntimeError("Failed to format temporary destination tab.")
 
+        note_requests = _build_note_requests(
+            sheet_id=temp_sheet_id,
+            note_cells_1based=note_cells_1based,
+        )
+        if note_requests and _sheets_batch_update_safe(service, spreadsheet_id, note_requests, stats) is None:
+            raise RuntimeError("Failed to write notes to temporary destination tab.")
+
         color_requests = _build_conditional_color_requests(
             sheet_id=temp_sheet_id,
             values=values,
@@ -2030,6 +2180,7 @@ def rebuild_monthly_tab(
     header_rows_1based: List[int],
     total_rows_1based: List[int],
     block_ranges_1based: List[Tuple[int, int]],
+    note_cells_1based: List[Tuple[int, int, str]],
     stats: Dict[str, Any],
 ) -> None:
     rebuild_period_tab(
@@ -2041,6 +2192,7 @@ def rebuild_monthly_tab(
         header_rows_1based=header_rows_1based,
         total_rows_1based=total_rows_1based,
         block_ranges_1based=block_ranges_1based,
+        note_cells_1based=note_cells_1based,
         output_headers=OUTPUT_HEADERS,
         stats=stats,
     )
@@ -2053,6 +2205,7 @@ def rebuild_weekly_tab(
     header_rows_1based: List[int],
     total_rows_1based: List[int],
     block_ranges_1based: List[Tuple[int, int]],
+    note_cells_1based: List[Tuple[int, int, str]],
     stats: Dict[str, Any],
 ) -> None:
     rebuild_period_tab(
@@ -2064,6 +2217,7 @@ def rebuild_weekly_tab(
         header_rows_1based=header_rows_1based,
         total_rows_1based=total_rows_1based,
         block_ranges_1based=block_ranges_1based,
+        note_cells_1based=note_cells_1based,
         output_headers=WEEKLY_OUTPUT_HEADERS,
         stats=stats,
     )
@@ -2335,7 +2489,10 @@ def main() -> Dict[str, Any]:
         print("\n" + "-" * 72)
         print("  STEP 6: Build output table values")
         print("-" * 72)
-        values, header_rows, total_rows, block_ranges = build_output_values(aggregated_rows, months_sorted)
+        values, header_rows, total_rows, block_ranges, monthly_note_cells = build_output_values(
+            aggregated_rows,
+            months_sorted,
+        )
         print(f"  Output rows (including headers/totals/separators): {len(values)}")
         print(f"  Header rows: {len(header_rows)} | Total rows: {len(total_rows)} | Table blocks: {len(block_ranges)}")
 
@@ -2349,6 +2506,7 @@ def main() -> Dict[str, Any]:
             header_rows_1based=header_rows,
             total_rows_1based=total_rows,
             block_ranges_1based=block_ranges,
+            note_cells_1based=monthly_note_cells,
             stats=stats,
         )
         print("  Destination tab rotation completed successfully.")
@@ -2422,9 +2580,11 @@ def main() -> Dict[str, Any]:
         print("\n" + "-" * 72)
         print("  STEP 10: Build weekly output values")
         print("-" * 72)
-        weekly_values, weekly_header_rows, weekly_total_rows, weekly_block_ranges = build_weekly_output_values(
+        weekly_values, weekly_header_rows, weekly_total_rows, weekly_block_ranges, weekly_note_cells = (
+            build_weekly_output_values(
             weekly_aggregated_rows,
             weeks_sorted,
+            )
         )
         print(f"  Weekly output rows (including headers/totals/separators): {len(weekly_values)}")
         print(
@@ -2442,6 +2602,7 @@ def main() -> Dict[str, Any]:
             header_rows_1based=weekly_header_rows,
             total_rows_1based=weekly_total_rows,
             block_ranges_1based=weekly_block_ranges,
+            note_cells_1based=weekly_note_cells,
             stats=stats,
         )
         print("  Weekly destination tab rotation completed successfully.")
