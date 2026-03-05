@@ -29,7 +29,7 @@ from googleapiclient.discovery import build
 # CONFIGURATION
 # =============================================================================
 
-SOURCE_SPREADSHEET_ID = "1EXrm0FbudIu44LmgSKXZt2lf96XYdOuwyRWf-6yhXus"
+SOURCE_SPREADSHEET_ID = "1sKoJT1tyH3OFOG0ZQQpzOpJbPK7owxk075-ZtX0Qbrg"
 
 DEST_SPREADSHEET_ID = "1RS29y36hwIIrgavJXH6NbI1SCqSr4ha4DsXwErS3aPc"
 DEST_MONTHLY_TAB_NAME = "Monthly"
