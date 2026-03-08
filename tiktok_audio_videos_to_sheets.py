@@ -59,7 +59,7 @@ def _format_threshold_label(value: int) -> str:
     return f"{value:,}"
 
 
-VIEWS_THRESHOLD = 10_000
+VIEWS_THRESHOLD = 1_000
 VIEWS_THRESHOLD_LABEL = _format_threshold_label(VIEWS_THRESHOLD)
 VIDEOS_KEPT_FIELD = "videos_kept_ge_threshold"
 MAX_SCROLLS = 2000
@@ -73,7 +73,7 @@ BASE_BODY = "#app div.e1pgfmdu0"
 THREE_COL = "#main-content-single_song"
 MUSIC_LIST = "#music-item-list"
 GRID_ITEMS = '#music-item-list [id^="grid-item-container-"]'
-ANCHOR_IN_ITEM = "div.css-ghnkqr-7937d88b--DivContainer-7937d88b--StyledDivContainerV2.eip9vuq0 > div > div > a"
+ANCHOR_IN_ITEM = 'div[data-e2e="music-item"] a[href*="/video/"]'
 META_IN_ANCHOR = "ov-ext-meta"
 # Full selectors (grid item -> anchor -> meta)
 ANCHORS_FULL = f'{MUSIC_LIST} [id^="grid-item-container-"] {ANCHOR_IN_ITEM}'
@@ -325,6 +325,9 @@ def _create_output_spreadsheet_impl(
             valueInputOption="RAW",
             body={"values": [OUTPUT_COLUMNS]}
         ).execute()
+
+        # Format D:H as comma-separated numbers and set a header filter (A:last col)
+        _format_output_count_columns(sheets_svc, spreadsheet_id, apply_filter=True)
         
         # Set sharing: anyone with link can edit
         permission = {
@@ -342,6 +345,136 @@ def _create_output_spreadsheet_impl(
     except HttpError as e:
         logger.error("Error creating output spreadsheet: %s", e)
         raise
+
+
+def _format_output_count_columns(
+    sheets_svc,
+    spreadsheet_id: str,
+    apply_filter: bool = False,
+) -> None:
+    """Apply output sheet formats (D:H counts, I duration, J date, K time)."""
+    try:
+        meta = sheets_svc.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId))",
+        ).execute()
+        sheets = meta.get("sheets", [])
+        if not sheets:
+            return
+        sheet_id = sheets[0].get("properties", {}).get("sheetId")
+        if sheet_id is None:
+            return
+
+        requests = [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,   # skip header row
+                        "startColumnIndex": 3, # D
+                        "endColumnIndex": 8,   # H (exclusive)
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "NUMBER",
+                                "pattern": "#,##0",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,   # skip header row
+                        "startColumnIndex": 8, # I
+                        "endColumnIndex": 9,   # I (exclusive)
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "TIME",
+                                "pattern": "[mm]:ss",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,   # skip header row
+                        "startColumnIndex": 9, # J
+                        "endColumnIndex": 10,  # J (exclusive)
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "DATE",
+                                "pattern": "m/d/yyyy",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,    # skip header row
+                        "startColumnIndex": 10, # K
+                        "endColumnIndex": 11,   # K (exclusive)
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "TIME",
+                                "pattern": "h:mm:ss AM/PM",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            },
+        ]
+
+        if apply_filter:
+            requests.append(
+                {
+                    "setBasicFilter": {
+                        "filter": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,      # include header row
+                                "startColumnIndex": 0,   # A
+                                "endColumnIndex": len(OUTPUT_COLUMNS),  # through last output column
+                            }
+                        }
+                    }
+                }
+            )
+
+        sheets_svc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+    except Exception as e:
+        logger.warning("Could not apply output number/date/time formats: %s", e)
 
 
 def append_rows_to_output_sheet(
@@ -370,6 +503,8 @@ def _append_rows_to_output_sheet_impl(
             insertDataOption="INSERT_ROWS",
             body={"values": rows}
         ).execute()
+        # Re-apply output formats after INSERT_ROWS so inserted rows keep number/date/time rendering.
+        _format_output_count_columns(sheets_svc, spreadsheet_id)
         
     except HttpError as e:
         logger.error("Error appending rows: %s", e)
@@ -486,6 +621,10 @@ def launch_browser_with_profile() -> Tuple[Playwright, BrowserContext, Page]:
 
 _PARSE_COUNT_CACHE: OrderedDict[str, int] = OrderedDict()
 _PARSE_COUNT_CACHE_MAX = 1024
+_LEADING_SHEET_PREFIX_RE = re.compile(
+    r"^[\s\u00A0\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069\uFEFF'`\u2018\u2019\u201B\u2032\u00B4]+"
+)
+_SHEETS_EPOCH_DATE = dt.date(1899, 12, 30)
 
 
 def parse_count(text: str) -> int:
@@ -532,6 +671,98 @@ def normalize_video_url(url: str) -> str:
     return urljoin("https://www.tiktok.com", url)
 
 
+def normalize_sheet_text(value: Any) -> str:
+    """Normalize text fields written to Sheets; strips leading quote/marker prefixes."""
+    if value is None:
+        return ""
+    s = str(value).replace("\u00A0", " ").strip()
+    if not s:
+        return ""
+    s = _LEADING_SHEET_PREFIX_RE.sub("", s)
+    return s.strip()
+
+
+def parse_duration_to_day_fraction(value: Any) -> Any:
+    """Parse duration text (m:ss / mm:ss / hh:mm:ss) to Sheets day fraction."""
+    s = normalize_sheet_text(value)
+    if not s:
+        return ""
+    m = re.fullmatch(r"(\d+):(\d{1,2})(?::(\d{1,2}))?", s)
+    if not m:
+        return ""
+    a = int(m.group(1))
+    b = int(m.group(2))
+    c = m.group(3)
+    if c is None:
+        minutes = a
+        seconds = b
+        if seconds >= 60:
+            return ""
+        total_seconds = minutes * 60 + seconds
+    else:
+        hours = a
+        minutes = b
+        seconds = int(c)
+        if minutes >= 60 or seconds >= 60:
+            return ""
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+    return total_seconds / 86400.0
+
+
+def parse_date_to_serial(value: Any) -> Any:
+    """Parse date text to Google Sheets serial day number."""
+    s = normalize_sheet_text(value)
+    if not s:
+        return ""
+    formats = (
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m-%d-%Y",
+        "%m-%d-%y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    )
+    parsed_date = None
+    for fmt in formats:
+        try:
+            parsed_date = dt.datetime.strptime(s, fmt).date()
+            break
+        except ValueError:
+            continue
+    if parsed_date is None:
+        return ""
+    return float((parsed_date - _SHEETS_EPOCH_DATE).days)
+
+
+def parse_time_to_day_fraction(value: Any) -> Any:
+    """Parse time text to Google Sheets day fraction."""
+    s = normalize_sheet_text(value)
+    if not s:
+        return ""
+    s = s.replace(".", "").upper()
+    formats = (
+        "%I:%M:%S %p",
+        "%I:%M %p",
+        "%I:%M:%S%p",
+        "%I:%M%p",
+        "%H:%M:%S",
+        "%H:%M",
+    )
+    parsed_time = None
+    for fmt in formats:
+        try:
+            parsed_time = dt.datetime.strptime(s, fmt).time()
+            break
+        except ValueError:
+            continue
+    if parsed_time is None:
+        return ""
+    total_seconds = parsed_time.hour * 3600 + parsed_time.minute * 60 + parsed_time.second
+    return total_seconds / 86400.0
+
+
 # ============================================================================
 # Scraping Functions
 # ============================================================================
@@ -564,6 +795,19 @@ _SCROLL_EL_JS = """
       return { before, after: el.scrollTop, height, client };
     }
 """
+_NUDGE_SCROLL_EL_JS = """
+    (el) => {
+      if (!el) return { before: 0, after: 0, height: 0, client: 0 };
+      const before = el.scrollTop;
+      const height = el.scrollHeight || 0;
+      const client = el.clientHeight || 0;
+      const up = Math.max(120, Math.floor(client * 0.25));
+      const down = Math.max(480, Math.floor(client * 0.9));
+      el.scrollTop = Math.max(0, before - up);
+      el.scrollTop = Math.min(height, el.scrollTop + down);
+      return { before, after: el.scrollTop, height, client };
+    }
+"""
 
 
 def get_scroller_handle(page) -> Any:
@@ -589,6 +833,21 @@ def scroll_to_bottom(page):
         handle = page.evaluate_handle(_FIND_SCROLLER_JS)
         setattr(page, "_scroller_handle", handle)
         return page.evaluate(_SCROLL_EL_JS, handle)
+
+
+def nudge_scroll(page):
+    """
+    Small up/down nudge on the active scroller to trigger lazy-load handlers
+    when direct "jump to bottom" reports no movement.
+    """
+    handle = get_scroller_handle(page)
+    try:
+        return page.evaluate(_NUDGE_SCROLL_EL_JS, handle)
+    except Exception:
+        setattr(page, "_scroller_handle", None)
+        handle = page.evaluate_handle(_FIND_SCROLLER_JS)
+        setattr(page, "_scroller_handle", handle)
+        return page.evaluate(_NUDGE_SCROLL_EL_JS, handle)
 
 
 def _get_grid_counts(page: Page) -> Dict[str, int]:
@@ -836,6 +1095,7 @@ def scroll_until_views_below_threshold(
     threshold_reached = False
     max_count_seen = 0
     iterations_no_increase = 0
+    no_movement_streak = 0
     prev_count = int(page.evaluate(_GRID_COUNT_JS, GRID_ITEMS))
 
     for scroll_num in range(max_scrolls):
@@ -850,11 +1110,53 @@ def scroll_until_views_below_threshold(
 
         scroll_moved = scroll_ret.get("after") != scroll_ret.get("before")
         if not scroll_moved:
+            # If items increased despite no scroll delta, continue scanning.
             new_count, _ = get_grid_count_and_last_views(page)
-            prev_count = new_count
-            logger.info("Stopping: scroll at bottom (no movement), newCount=%s", new_count)
-            threshold_reached = True
-            break
+            if new_count > prev_count:
+                prev_count = new_count
+                no_movement_streak = 0
+                continue
+
+            # Nudge to fire lazy-load handlers that may not trigger on no-op scroll.
+            try:
+                nudge_scroll(page)
+            except Exception:
+                pass
+
+            loaded_after_nudge = wait_for_new_items_and_extension_settle(
+                page, prev_count=prev_count, wait_timeout_ms=800, settle_seconds=0.1
+            )
+            if loaded_after_nudge:
+                new_count, delta, all_new_below, max_new_views = check_new_items_below_threshold(
+                    page, prev_count, threshold
+                )
+                prev_count = new_count
+                no_movement_streak = 0
+                if delta > 0 and all_new_below:
+                    threshold_reached = True
+                    logger.info("Stopping: new batch delta=%s, maxNewViews=%s < threshold=%s",
+                        delta, max_new_views, threshold)
+                    break
+                continue
+
+            new_count, _ = get_grid_count_and_last_views(page)
+            if new_count > prev_count:
+                prev_count = new_count
+                no_movement_streak = 0
+                continue
+
+            no_movement_streak += 1
+            if no_movement_streak >= STAGNATION_SCROLLS:
+                prev_count = new_count
+                logger.info(
+                    "Stopping: scroll at bottom after %s no-move checks, newCount=%s",
+                    no_movement_streak, new_count
+                )
+                threshold_reached = True
+                break
+            continue
+
+        no_movement_streak = 0
 
         loaded = wait_for_new_items_and_extension_settle(page, prev_count=prev_count)
         if loaded:
@@ -966,6 +1268,9 @@ def scrape_loaded_items(
             views = parse_count(row["views"])
             if views < threshold:
                 continue
+            duration = parse_duration_to_day_fraction(row.get("duration", ""))
+            upload_date = parse_date_to_serial(row.get("upload_date", ""))
+            upload_time = parse_time_to_day_fraction(row.get("upload_time", ""))
             output_rows.append([
                 video_link,
                 username,
@@ -975,9 +1280,9 @@ def scrape_loaded_items(
                 parse_count(row["comments"]),
                 parse_count(row["saves"]),
                 parse_count(row["shares"]),
-                row.get("duration", ""),
-                row.get("upload_date", ""),
-                row.get("upload_time", ""),
+                duration,
+                upload_date,
+                upload_time,
             ])
         except Exception as e:
             logger.warning("Error scraping item %s: %s", idx, e)
