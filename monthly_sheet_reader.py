@@ -53,7 +53,7 @@ COLUMNS = {
 }
 
 PAYMENT_STATUS_PAID = "PAID"
-CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "auto_auth.json")
+CREDENTIALS_PATH = "/work/auto_auth.json"
 DEBUG_OUTPUT_DIR = "logs/monthly_debug"
 WRITE_DEBUG_ARTIFACTS = True
 
@@ -454,13 +454,16 @@ _batch_limiter = RateLimiter(max_requests_per_minute=50)
 
 def setup_sheets_service():
     """Create Sheets API service using service-account credentials."""
-    if not os.path.isfile(CREDENTIALS_PATH):
+    creds_path = Path(CREDENTIALS_PATH)
+    if not creds_path.is_file():
         raise FileNotFoundError(
             f"Credentials file not found: {CREDENTIALS_PATH}. "
-            "Set GOOGLE_APPLICATION_CREDENTIALS or add auto_auth.json."
+            "Make sure this file exists in Deepnote."
         )
+    creds_path = creds_path.resolve()
+    print(f"  Using credentials file: {creds_path}")
     creds = Credentials.from_service_account_file(
-        CREDENTIALS_PATH,
+        str(creds_path),
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return build("sheets", "v4", credentials=creds)

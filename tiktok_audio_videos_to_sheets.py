@@ -3,6 +3,8 @@ TikTok Audio Videos to Google Sheets Scraper
 
 This script reads a Google Sheet with Song Name and TikTok Audio URL columns,
 scrapes videos from each audio page, and creates output sheets with video data.
+After writing each output sheet, it sorts rows by upload_date (Z->A), detects
+views/saves spikes, and colors spike rows green.
 
 Required pip packages:
 - playwright
@@ -13,6 +15,7 @@ Required pip packages:
 
 Prerequisites:
 - auto_auth.json (service account credentials) in the same directory
+- spotify_secret.json (Spotify API client credentials) in the same directory
 - Persistent Chrome profile already logged into TikTok with extension installed
 - Run: playwright install chromium
 
@@ -32,7 +35,7 @@ import time
 import datetime as dt
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 from urllib.parse import urljoin
 from collections import OrderedDict
 
@@ -40,6 +43,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Playwright
+import requests
 from tqdm import tqdm
 
 # Input / auth
@@ -48,7 +52,23 @@ INPUT_SHEET_URL = os.getenv(
     "https://docs.google.com/spreadsheets/d/1bWlvp89BtbsMYs4wiW-XFeUB8RK8bPGwHz_YfQXHunU/edit?usp=sharing"
 )
 AUTH_FILE = Path(__file__).parent / "auto_auth.json"
+SPOTIFY_SECRET_FILE = Path(__file__).parent / "spotify_secret.json"
 PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
+
+# Input sheet expected columns:
+# A: Song Name | B: Spotify Audio URL | C: Spotify Release Date | D: Tiktok Audio URL | E: Output Link
+INPUT_COL_SONG_NAME = 0
+INPUT_COL_TIKTOK_AUDIO_URL = 3
+INPUT_COL_OUTPUT_LINK = 4
+INPUT_HEADER_SONG_NAME = "song name"
+INPUT_HEADER_TIKTOK_AUDIO_URLS = {"tiktok audio url", "tik tok audio url"}
+INPUT_HEADER_OUTPUT_LINK = "output link"
+INPUT_COL_SPOTIFY_AUDIO_URL = 1
+INPUT_COL_SPOTIFY_RELEASE_DATE = 2
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+SPOTIFY_HTTP_TIMEOUT_SEC = 20
+SPOTIFY_FORCE_REFRESH_EXISTING_RELEASE_DATES = False
 
 # Scraping thresholds
 def _format_threshold_label(value: int) -> str:
@@ -59,14 +79,18 @@ def _format_threshold_label(value: int) -> str:
     return f"{value:,}"
 
 
-VIEWS_THRESHOLD = 1_000
+VIEWS_THRESHOLD = 100 # 100 view is enough to be considered a video
 VIEWS_THRESHOLD_LABEL = _format_threshold_label(VIEWS_THRESHOLD)
 VIDEOS_KEPT_FIELD = "videos_kept_ge_threshold"
-MAX_SCROLLS = 2000
-STAGNATION_SCROLLS = 10
+MAX_SCROLLS = 200000
+STAGNATION_SCROLLS = 3
 SORT_SETTLE_SECONDS = 0.25
 BUFFER_SCROLLS_AFTER_THRESHOLD = 1
 DEBUG_SCROLL = False  # When False, scroll/debug logs are silent
+SONG_SCRAPE_PROMPT_INTERVAL_SEC = 15 * 60
+TAIL_READY_POLL_INTERVAL_SEC = 0.1
+TAIL_READY_NUDGE_EVERY_POLLS = 50
+TAIL_ROWS_APPEAR_STALL_POLLS = 80
 
 # DOM selectors (music grid)
 BASE_BODY = "#app div.e1pgfmdu0"
@@ -151,6 +175,13 @@ OUTPUT_COLUMNS = [
     "upload_date",
     "upload_time",
 ]
+OUTPUT_COL_IDX_VIDEO_LINK = OUTPUT_COLUMNS.index("video_link")
+OUTPUT_COL_IDX_VIEWS = OUTPUT_COLUMNS.index("views")
+OUTPUT_COL_IDX_SAVES = OUTPUT_COLUMNS.index("saves")
+OUTPUT_COL_IDX_UPLOAD_DATE = OUTPUT_COLUMNS.index("upload_date")
+OUTPUT_COLUMNS_COUNT = len(OUTPUT_COLUMNS)
+SPIKE_Q1_QUANTILE = 0.25
+SPIKE_Q3_QUANTILE = 0.90
 
 # Google API scopes
 SCOPES = [
@@ -195,6 +226,10 @@ def setup_logging(log_file_path: Path) -> None:
 logger = logging.getLogger(__name__)
 
 
+class SongSkippedByUserError(Exception):
+    """Raised when user chooses to skip a long-running song scrape."""
+
+
 # ============================================================================
 # Google Sheets API Functions
 # ============================================================================
@@ -222,8 +257,194 @@ def get_google_clients() -> Tuple:
     return sheets_service, drive_service
 
 
+_SPOTIFY_TOKEN_CACHE: Dict[str, Any] = {"access_token": "", "expires_at": 0.0}
+
+
+def _load_spotify_credentials() -> Tuple[str, str]:
+    if not SPOTIFY_SECRET_FILE.exists():
+        raise FileNotFoundError(f"Spotify secret file not found: {SPOTIFY_SECRET_FILE}")
+    raw = json.loads(SPOTIFY_SECRET_FILE.read_text(encoding="utf-8"))
+    client_id = str(raw.get("client_id", "")).strip()
+    client_secret = str(raw.get("client_secret", "")).strip()
+    if not client_id or not client_secret:
+        raise ValueError("spotify_secret.json must include non-empty client_id and client_secret")
+    return client_id, client_secret
+
+
+def _get_spotify_access_token(force_refresh: bool = False) -> str:
+    now = time.time()
+    token = str(_SPOTIFY_TOKEN_CACHE.get("access_token", "") or "")
+    expires_at = float(_SPOTIFY_TOKEN_CACHE.get("expires_at", 0.0) or 0.0)
+    if (not force_refresh) and token and expires_at > now + 30:
+        return token
+
+    client_id, client_secret = _load_spotify_credentials()
+    response = requests.post(
+        SPOTIFY_TOKEN_URL,
+        data={"grant_type": "client_credentials"},
+        auth=(client_id, client_secret),
+        timeout=SPOTIFY_HTTP_TIMEOUT_SEC,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Spotify token request failed: {response.status_code} {response.text[:200]}")
+
+    payload = response.json()
+    access_token = str(payload.get("access_token", "")).strip()
+    expires_in = int(payload.get("expires_in", 3600) or 3600)
+    if not access_token:
+        raise RuntimeError("Spotify token response missing access_token")
+
+    _SPOTIFY_TOKEN_CACHE["access_token"] = access_token
+    _SPOTIFY_TOKEN_CACHE["expires_at"] = now + max(60, expires_in)
+    return access_token
+
+
+def _extract_spotify_resource(spotify_url: str) -> Optional[Tuple[str, str]]:
+    s = str(spotify_url or "").strip()
+    if not s:
+        return None
+
+    m = re.search(r"open\.spotify\.com/(track|album)/([A-Za-z0-9]+)", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower(), m.group(2)
+
+    m = re.match(r"spotify:(track|album):([A-Za-z0-9]+)$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower(), m.group(2)
+
+    return None
+
+
+def _normalize_spotify_release_date(release_date: str, precision: str) -> str:
+    rd = str(release_date or "").strip()
+    p = str(precision or "").strip().lower()
+    if not rd:
+        return ""
+    # Spotify can return YYYY, YYYY-MM, or YYYY-MM-DD.
+    # Normalize to full date for consistent sheet values.
+    if p == "year" and re.fullmatch(r"\d{4}", rd):
+        return f"{rd}-01-01"
+    if p == "month" and re.fullmatch(r"\d{4}-\d{2}", rd):
+        return f"{rd}-01"
+    return rd
+
+
+def _fetch_spotify_release_date(spotify_url: str) -> Optional[str]:
+    resource = _extract_spotify_resource(spotify_url)
+    if not resource:
+        return None
+    resource_type, resource_id = resource
+
+    endpoint = "tracks" if resource_type == "track" else "albums"
+
+    def _do_request(access_token: str) -> requests.Response:
+        return requests.get(
+            f"{SPOTIFY_API_BASE}/{endpoint}/{resource_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=SPOTIFY_HTTP_TIMEOUT_SEC,
+        )
+
+    token = _get_spotify_access_token(force_refresh=False)
+    response = _do_request(token)
+    if response.status_code == 401:
+        token = _get_spotify_access_token(force_refresh=True)
+        response = _do_request(token)
+
+    if response.status_code == 429:
+        retry_after = int(response.headers.get("Retry-After", "1") or "1")
+        time.sleep(max(1, min(retry_after, 5)))
+        response = _do_request(token)
+
+    if response.status_code != 200:
+        logger.warning(
+            "Spotify API request failed for %s (%s): %s",
+            spotify_url,
+            resource_type,
+            response.status_code,
+        )
+        return None
+
+    payload = response.json()
+    if resource_type == "track":
+        album = payload.get("album", {}) or {}
+        release_date = str(album.get("release_date", "")).strip()
+        precision = str(album.get("release_date_precision", "")).strip()
+    else:
+        release_date = str(payload.get("release_date", "")).strip()
+        precision = str(payload.get("release_date_precision", "")).strip()
+
+    normalized = _normalize_spotify_release_date(release_date, precision)
+    return normalized or None
+
+
+def update_spotify_release_dates(sheets_svc, spreadsheet_id: str) -> int:
+    """
+    For each input row:
+      - Read Spotify URL from column B
+      - Resolve release date via Spotify API
+      - Write release date to column C
+    Returns number of rows updated.
+    """
+    result = sheets_svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range="A:C",
+    ).execute()
+    values = result.get("values", [])
+    if not values:
+        logger.info("Spotify release date update skipped: input sheet empty")
+        return 0
+
+    release_cache: Dict[str, Optional[str]] = {}
+    updates: List[Dict[str, Any]] = []
+
+    for row_index, row in enumerate(values[1:], start=2):
+        spotify_url = str(row[INPUT_COL_SPOTIFY_AUDIO_URL]).strip() if len(row) > INPUT_COL_SPOTIFY_AUDIO_URL else ""
+        current_release = str(row[INPUT_COL_SPOTIFY_RELEASE_DATE]).strip() if len(row) > INPUT_COL_SPOTIFY_RELEASE_DATE else ""
+        if not spotify_url:
+            continue
+        if current_release and not SPOTIFY_FORCE_REFRESH_EXISTING_RELEASE_DATES:
+            continue
+
+        if spotify_url in release_cache:
+            release_date = release_cache[spotify_url]
+        else:
+            try:
+                release_date = _fetch_spotify_release_date(spotify_url)
+            except Exception as e:
+                logger.warning("Spotify lookup failed for row %s: %s", row_index, e)
+                release_date = None
+            release_cache[spotify_url] = release_date
+
+        if not release_date:
+            continue
+
+        updates.append({"range": f"C{row_index}", "values": [[release_date]]})
+
+    if not updates:
+        logger.info("Spotify release date update: no rows needed updates")
+        return 0
+
+    chunk_size = 100
+    for i in range(0, len(updates), chunk_size):
+        chunk = updates[i:i + chunk_size]
+        sheets_svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "USER_ENTERED", "data": chunk},
+        ).execute()
+
+    logger.info("Spotify release dates updated for %s row(s)", len(updates))
+    return len(updates)
+
+
 def get_input_rows(sheets_svc, spreadsheet_id: str) -> List[Dict]:
-    """Read A:B from first sheet. Return list of {song_name, audio_url, row_index} (row_index 1-based)."""
+    """
+    Read input rows using current schema:
+      A Song Name, B Spotify Audio URL, C Spotify Release Date,
+      D Tiktok Audio URL, E Output Link.
+    Return list of:
+      {song_name, audio_url, spotify_audio_url, spotify_release_date, row_index}
+    where row_index is 1-based.
+    """
     return _get_input_rows_impl(sheets_svc, spreadsheet_id)
 
 
@@ -231,22 +452,43 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
     try:
         result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range="A:B"  # Read columns A and B
+            range="A:E"  # Read Song Name through Output Link
         ).execute()
         
         values = result.get("values", [])
         if not values:
             logger.warning("No data found in input sheet")
             return []
+
+        header = values[0] if values else []
+        header_norm = [str(h).strip().lower() for h in header]
+        if len(header_norm) > INPUT_COL_SONG_NAME and header_norm[INPUT_COL_SONG_NAME] != INPUT_HEADER_SONG_NAME:
+            logger.warning(
+                "Input header A1 expected '%s' but found '%s'",
+                INPUT_HEADER_SONG_NAME,
+                header[INPUT_COL_SONG_NAME] if len(header) > INPUT_COL_SONG_NAME else "",
+            )
+        if len(header_norm) > INPUT_COL_TIKTOK_AUDIO_URL and header_norm[INPUT_COL_TIKTOK_AUDIO_URL] not in INPUT_HEADER_TIKTOK_AUDIO_URLS:
+            logger.warning(
+                "Input header D1 expected one of %s but found '%s'",
+                sorted(INPUT_HEADER_TIKTOK_AUDIO_URLS),
+                header[INPUT_COL_TIKTOK_AUDIO_URL] if len(header) > INPUT_COL_TIKTOK_AUDIO_URL else "",
+            )
         
         rows = []
         for idx, row in enumerate(values[1:], start=2):
-            if len(row) < 2 or not row[0] or not row[1]:
+            if (
+                len(row) <= INPUT_COL_TIKTOK_AUDIO_URL
+                or not str(row[INPUT_COL_SONG_NAME]).strip()
+                or not str(row[INPUT_COL_TIKTOK_AUDIO_URL]).strip()
+            ):
                 continue  # Skip empty rows
             
             rows.append({
-                "song_name": row[0].strip(),
-                "audio_url": row[1].strip(),
+                "song_name": str(row[INPUT_COL_SONG_NAME]).strip(),
+                "audio_url": str(row[INPUT_COL_TIKTOK_AUDIO_URL]).strip(),
+                "spotify_audio_url": str(row[INPUT_COL_SPOTIFY_AUDIO_URL]).strip() if len(row) > INPUT_COL_SPOTIFY_AUDIO_URL else "",
+                "spotify_release_date": str(row[INPUT_COL_SPOTIFY_RELEASE_DATE]).strip() if len(row) > INPUT_COL_SPOTIFY_RELEASE_DATE else "",
                 "row_index": idx
             })
         
@@ -259,7 +501,7 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
 
 
 def ensure_output_link_column(sheets_svc, spreadsheet_id: str) -> None:
-    """Ensure 'Output Link' exists in header (column C); append if missing."""
+    """Ensure header row has 'Output Link' in column E."""
     _ensure_output_link_column_impl(sheets_svc, spreadsheet_id)
 
 
@@ -273,11 +515,13 @@ def _ensure_output_link_column_impl(sheets_svc, spreadsheet_id: str) -> None:
         
         headers = result.get("values", [[]])[0] if result.get("values") else []
         
-        # Check if "Output Link" exists
-        if "Output Link" not in headers:
-            # Append "Output Link" to header row
-            headers.append("Output Link")
-            
+        # Ensure Output Link is at column E (index 4)
+        while len(headers) <= INPUT_COL_OUTPUT_LINK:
+            headers.append("")
+
+        current = str(headers[INPUT_COL_OUTPUT_LINK]).strip()
+        if current.lower() != INPUT_HEADER_OUTPUT_LINK:
+            headers[INPUT_COL_OUTPUT_LINK] = "Output Link"
             sheets_svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range="1:1",
@@ -285,9 +529,9 @@ def _ensure_output_link_column_impl(sheets_svc, spreadsheet_id: str) -> None:
                 body={"values": [headers]}
             ).execute()
             
-            logger.info("Added 'Output Link' column to input sheet")
+            logger.info("Set 'Output Link' header in column E")
         else:
-            logger.info("'Output Link' column already exists")
+            logger.info("'Output Link' header already exists in column E")
             
     except HttpError as e:
         logger.error("Error ensuring output link column: %s", e)
@@ -511,6 +755,244 @@ def _append_rows_to_output_sheet_impl(
         raise
 
 
+def postprocess_output_sheet(sheets_svc, spreadsheet_id: str) -> int:
+    """
+    Post-process one generated output sheet:
+    1) Sort rows by upload_date descending (Z->A).
+    2) Detect spikes in views/saves using IQR-style thresholds.
+    3) Mark spike rows green.
+
+    Returns number of marked rows.
+    """
+    return _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id)
+
+
+def _get_primary_sheet_props(sheets_svc, spreadsheet_id: str) -> Tuple[int, str]:
+    meta = sheets_svc.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    sheets = meta.get("sheets", [])
+    if not sheets:
+        raise ValueError(f"No sheets found in spreadsheet {spreadsheet_id}")
+    props = sheets[0].get("properties", {})
+    sheet_id = props.get("sheetId")
+    title = props.get("title", "Sheet1")
+    if sheet_id is None:
+        raise ValueError(f"Missing sheetId in spreadsheet {spreadsheet_id}")
+    return int(sheet_id), str(title)
+
+
+def _read_output_rows_unformatted(
+    sheets_svc,
+    spreadsheet_id: str,
+    sheet_title: str,
+) -> List[List[Any]]:
+    safe_title = sheet_title.replace("'", "''")
+    result = sheets_svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{safe_title}'!A2:K",
+        valueRenderOption="UNFORMATTED_VALUE",
+        dateTimeRenderOption="SERIAL_NUMBER",
+    ).execute()
+    return result.get("values", [])
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).replace(",", "").strip()
+    if not s:
+        return None
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s in {"", "-", ".", "-.", ".-"}:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _quantile_linear(values: List[float], q: float) -> float:
+    if not values:
+        raise ValueError("Cannot compute quantile of empty list")
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n == 1:
+        return float(sorted_vals[0])
+    q = max(0.0, min(1.0, q))
+    pos = (n - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac)
+
+
+def _serial_to_iso_date(value: Any) -> str:
+    serial = _to_float(value)
+    if serial is None:
+        s = str(value or "").strip()
+        return s
+    try:
+        day_number = int(serial)
+        return (_SHEETS_EPOCH_DATE + dt.timedelta(days=day_number)).isoformat()
+    except Exception:
+        return str(value)
+
+
+def _contiguous_ranges(sorted_indices: List[int]) -> List[Tuple[int, int]]:
+    if not sorted_indices:
+        return []
+    ranges: List[Tuple[int, int]] = []
+    start = prev = sorted_indices[0]
+    for idx in sorted_indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        ranges.append((start, prev + 1))
+        start = prev = idx
+    ranges.append((start, prev + 1))
+    return ranges
+
+
+def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
+    sheet_id, sheet_title = _get_primary_sheet_props(sheets_svc, spreadsheet_id)
+
+    rows_before_sort = _read_output_rows_unformatted(sheets_svc, spreadsheet_id, sheet_title)
+    if not rows_before_sort:
+        logger.info("Post-process skipped (%s): no data rows", spreadsheet_id)
+        return 0
+
+    # Sort uploaded rows by upload_date (column J) descending = Z->A.
+    sort_request = {
+        "sortRange": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,  # skip header
+                "endRowIndex": 1 + len(rows_before_sort),
+                "startColumnIndex": 0,
+                "endColumnIndex": OUTPUT_COLUMNS_COUNT,
+            },
+            "sortSpecs": [
+                {
+                    "dimensionIndex": OUTPUT_COL_IDX_UPLOAD_DATE,
+                    "sortOrder": "DESCENDING",
+                }
+            ],
+        }
+    }
+    sheets_svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [sort_request]},
+    ).execute()
+    logger.info("Sorted output sheet by upload_date Z->A: %s", spreadsheet_id)
+
+    rows_after_sort = _read_output_rows_unformatted(sheets_svc, spreadsheet_id, sheet_title)
+    if not rows_after_sort:
+        logger.info("Post-process skipped after sort (%s): no rows", spreadsheet_id)
+        return 0
+
+    records: List[Dict[str, Any]] = []
+    for row_idx_1_based, row in enumerate(rows_after_sort, start=2):
+        video_link = str(row[OUTPUT_COL_IDX_VIDEO_LINK]).strip() if len(row) > OUTPUT_COL_IDX_VIDEO_LINK else ""
+        views = _to_float(row[OUTPUT_COL_IDX_VIEWS] if len(row) > OUTPUT_COL_IDX_VIEWS else 0) or 0.0
+        saves = _to_float(row[OUTPUT_COL_IDX_SAVES] if len(row) > OUTPUT_COL_IDX_SAVES else 0) or 0.0
+        upload_date = row[OUTPUT_COL_IDX_UPLOAD_DATE] if len(row) > OUTPUT_COL_IDX_UPLOAD_DATE else ""
+        if not video_link:
+            continue
+        records.append(
+            {
+                "row_idx_1_based": row_idx_1_based,
+                "video_link": video_link,
+                "views": float(views),
+                "saves": float(saves),
+                "upload_date": upload_date,
+            }
+        )
+
+    if not records:
+        logger.info("Post-process skipped (%s): no valid records with video_link", spreadsheet_id)
+        return 0
+
+    views_vals = [r["views"] for r in records]
+    saves_vals = [r["saves"] for r in records]
+
+    views_q1 = _quantile_linear(views_vals, SPIKE_Q1_QUANTILE)
+    views_q3 = _quantile_linear(views_vals, SPIKE_Q3_QUANTILE)
+    views_threshold = views_q3 + 1.5 * (views_q3 - views_q1)
+
+    saves_q1 = _quantile_linear(saves_vals, SPIKE_Q1_QUANTILE)
+    saves_q3 = _quantile_linear(saves_vals, SPIKE_Q3_QUANTILE)
+    saves_threshold = saves_q3 + 1.5 * (saves_q3 - saves_q1)
+
+    spike_records: List[Dict[str, Any]] = []
+    for rec in records:
+        views_spike = rec["views"] > views_threshold
+        saves_spike = rec["saves"] > saves_threshold
+        if not (views_spike or saves_spike):
+            continue
+        if views_spike and saves_spike:
+            spike_type = "views_and_saves"
+        elif views_spike:
+            spike_type = "views_only"
+        else:
+            spike_type = "saves_only"
+        rec2 = dict(rec)
+        rec2["spike_type"] = spike_type
+        spike_records.append(rec2)
+
+    logger.info(
+        "Spike thresholds for %s: views>%s, saves>%s",
+        spreadsheet_id,
+        int(round(views_threshold)),
+        int(round(saves_threshold)),
+    )
+
+    if not spike_records:
+        logger.info("No spikes detected in output sheet: %s", spreadsheet_id)
+        return 0
+
+    for rec in spike_records:
+        logger.info(
+            "SPIKE [%s] %s | %s | views=%s | saves=%s",
+            rec["spike_type"],
+            _serial_to_iso_date(rec["upload_date"]),
+            rec["video_link"],
+            int(round(rec["views"])),
+            int(round(rec["saves"])),
+        )
+
+    color = {"red": 0.85, "green": 0.97, "blue": 0.85}
+    row_indices_0_based = sorted({rec["row_idx_1_based"] - 1 for rec in spike_records})
+    requests = []
+    for start_row, end_row in _contiguous_ranges(row_indices_0_based):
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_row,
+                        "endRowIndex": end_row,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": OUTPUT_COLUMNS_COUNT,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+
+    sheets_svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests},
+    ).execute()
+
+    logger.info("Marked %s spike row(s) green in %s", len(row_indices_0_based), spreadsheet_id)
+    return len(row_indices_0_based)
+
+
 _OUTPUT_LINK_QUEUE: List[Tuple[str, int, str]] = []  # (spreadsheet_id, row_index, output_url)
 _OUTPUT_LINK_BATCH_SIZE = 5
 
@@ -528,7 +1010,7 @@ def _flush_output_link_queue(sheets_svc) -> None:
     for spreadsheet_id, updates in by_sheet.items():
         try:
             data = [
-                {"range": "C%d" % row_index, "values": [[output_url]]}
+                {"range": "E%d" % row_index, "values": [[output_url]]}
                 for row_index, output_url in updates
             ]
             sheets_svc.spreadsheets().values().batchUpdate(
@@ -559,7 +1041,7 @@ def write_output_link_back(
     row_index: int,
     output_url: str
 ) -> None:
-    """Write output_url to column C at row_index. Uses queue for batching."""
+    """Write output_url to column E at row_index. Uses queue for batching."""
     queue_output_link(sheets_svc, spreadsheet_id, row_index, output_url, force_flush=False)
 
 
@@ -1054,17 +1536,30 @@ def check_new_items_below_threshold(
 _WAIT_COUNT_JS = "([sel, prev]) => document.querySelectorAll(sel).length > prev"
 
 
+def _noop_watchdog() -> None:
+    return None
+
+
 def wait_for_new_items_and_extension_settle(
     page: Page,
     prev_count: int,
     wait_timeout_ms: int = 5000,
     settle_seconds: float = SORT_SETTLE_SECONDS,
+    watchdog_cb: Optional[Callable[[], None]] = None,
 ) -> bool:
     """
     Wait until TikTok loads more GRID_ITEMS than prev_count.
-    Adaptive settle: only sleep settle_seconds when new items actually arrived.
+    After items arrive, wait for new extractable tail rows, then wait
+    indefinitely until extension views are ready for those rows.
+    If extractable tail rows never appear and counts stay stalled, return False
+    so the caller can continue end-of-list detection.
     Returns True if new items loaded, else False.
     """
+    watchdog = watchdog_cb or _noop_watchdog
+    try:
+        baseline_rows = len(page.evaluate(_CHECK_NEW_ITEMS_JS, _CHECK_NEW_ARGS))
+    except Exception:
+        baseline_rows = 0
     loaded = False
     try:
         page.wait_for_function(
@@ -1077,6 +1572,60 @@ def wait_for_new_items_and_extension_settle(
         loaded = False
 
     if loaded:
+        polls = 0
+        no_progress_polls = 0
+        new_rows_seen = False
+        try:
+            last_grid_count = int(page.evaluate(_GRID_COUNT_JS, GRID_ITEMS))
+        except Exception:
+            last_grid_count = prev_count
+        while True:
+            watchdog()
+            try:
+                grid_count_now = int(page.evaluate(_GRID_COUNT_JS, GRID_ITEMS))
+            except Exception:
+                grid_count_now = last_grid_count
+            try:
+                rows = page.evaluate(_CHECK_NEW_ITEMS_JS, _CHECK_NEW_ARGS)
+                row_count = len(rows)
+                if row_count <= baseline_rows:
+                    ready = False
+                else:
+                    new_rows_seen = True
+                    ready = True
+                    for i in range(baseline_rows, row_count):
+                        views_text = rows[i].get("views", "") or ""
+                        if not str(views_text).strip():
+                            ready = False
+                            break
+            except Exception:
+                ready = False
+                row_count = baseline_rows
+            if ready:
+                break
+
+            if not new_rows_seen:
+                progressed = row_count > baseline_rows or grid_count_now > last_grid_count
+                if progressed:
+                    no_progress_polls = 0
+                else:
+                    no_progress_polls += 1
+                    if no_progress_polls >= TAIL_ROWS_APPEAR_STALL_POLLS:
+                        if DEBUG_SCROLL:
+                            logger.info(
+                                "[DEBUG] tail rows stalled: prev_count=%s baseline_rows=%s grid_now=%s polls=%s",
+                                prev_count, baseline_rows, grid_count_now, no_progress_polls
+                            )
+                        return False
+                last_grid_count = max(last_grid_count, grid_count_now)
+
+            polls += 1
+            if polls % TAIL_READY_NUDGE_EVERY_POLLS == 0:
+                try:
+                    nudge_scroll(page)
+                except Exception:
+                    pass
+            time.sleep(TAIL_READY_POLL_INTERVAL_SEC)
         time.sleep(settle_seconds)
     return loaded
 
@@ -1086,6 +1635,7 @@ def scroll_until_views_below_threshold(
     root_selector: str,
     threshold: int = VIEWS_THRESHOLD,
     max_scrolls: int = MAX_SCROLLS,
+    watchdog_cb: Optional[Callable[[], None]] = None,
 ):
     """
     Scrolls until a full new scroll loads new items AND all newly loaded items
@@ -1093,12 +1643,14 @@ def scroll_until_views_below_threshold(
     """
 
     threshold_reached = False
+    watchdog = watchdog_cb or _noop_watchdog
     max_count_seen = 0
     iterations_no_increase = 0
     no_movement_streak = 0
     prev_count = int(page.evaluate(_GRID_COUNT_JS, GRID_ITEMS))
 
     for scroll_num in range(max_scrolls):
+        watchdog()
         try:
             scroll_ret = scroll_to_bottom(page)
             if DEBUG_SCROLL:
@@ -1124,7 +1676,7 @@ def scroll_until_views_below_threshold(
                 pass
 
             loaded_after_nudge = wait_for_new_items_and_extension_settle(
-                page, prev_count=prev_count, wait_timeout_ms=800, settle_seconds=0.1
+                page, prev_count=prev_count, wait_timeout_ms=800, settle_seconds=0.1, watchdog_cb=watchdog
             )
             if loaded_after_nudge:
                 new_count, delta, all_new_below, max_new_views = check_new_items_below_threshold(
@@ -1158,7 +1710,7 @@ def scroll_until_views_below_threshold(
 
         no_movement_streak = 0
 
-        loaded = wait_for_new_items_and_extension_settle(page, prev_count=prev_count)
+        loaded = wait_for_new_items_and_extension_settle(page, prev_count=prev_count, watchdog_cb=watchdog)
         if loaded:
             new_count, delta, all_new_below, max_new_views = check_new_items_below_threshold(
                 page, prev_count, threshold
@@ -1209,6 +1761,7 @@ def scroll_until_views_below_threshold(
         buffer_left = BUFFER_SCROLLS_AFTER_THRESHOLD
 
         while buffer_left > 0:
+            watchdog()
             if prev_count == 0:
                 break
 
@@ -1220,7 +1773,7 @@ def scroll_until_views_below_threshold(
             scroll_moved = scroll_ret.get("after") != scroll_ret.get("before")
             if not scroll_moved:
                 break
-            loaded = wait_for_new_items_and_extension_settle(page, prev_count=prev_count)
+            loaded = wait_for_new_items_and_extension_settle(page, prev_count=prev_count, watchdog_cb=watchdog)
             if loaded:
                 new_count, delta, all_new_below, max_new_views = check_new_items_below_threshold(
                     page, prev_count, threshold
@@ -1310,7 +1863,32 @@ def process_audio_url(
 ) -> Tuple[List[List], int]:
     """Process audio URL: navigate, scroll, scrape. Return (output rows, grid_count)."""
     logger.info("Processing: %s", song_name)
+    next_watchdog_prompt_at = time.monotonic() + SONG_SCRAPE_PROMPT_INTERVAL_SEC
+
+    def _scrape_watchdog() -> None:
+        nonlocal next_watchdog_prompt_at
+        now = time.monotonic()
+        if now < next_watchdog_prompt_at:
+            return
+
+        prompt = (
+            f"Song '{song_name}' has been scraping for over 15 minutes. "
+            "Continue waiting for this song? [y/n]: "
+        )
+        while True:
+            answer = input(prompt).strip().lower()
+            if answer in ("y", "yes"):
+                next_watchdog_prompt_at = time.monotonic() + SONG_SCRAPE_PROMPT_INTERVAL_SEC
+                logger.warning("Continuing scrape for %s for another 15-minute window.", song_name)
+                return
+            if answer in ("n", "no"):
+                msg = f"Skipped by user after 15-minute scrape window: {song_name}"
+                logger.warning(msg)
+                raise SongSkippedByUserError(msg)
+            print("Please enter 'y' or 'n'.")
+
     try:
+        _scrape_watchdog()
         page.goto(audio_url, wait_until="domcontentloaded", timeout=60000)
         setattr(page, "_scroller_handle", None)
 
@@ -1318,6 +1896,7 @@ def process_audio_url(
             logger.warning("TikTok blocker/captcha detected")
             input("TikTok may be blocking. Fix it in the open browser, then press Enter...")
 
+        _scrape_watchdog()
         root_selector = wait_for_grid_and_extension(page)
         if DEBUG_SCROLL:
             counts = _get_grid_counts(page)
@@ -1325,7 +1904,7 @@ def process_audio_url(
                 page.url[:80], root_selector, counts["items"], counts["anchors"], counts["metas"])
             logger.info("[DEBUG] Before scroll_until_views_below_threshold")
 
-        scroll_until_views_below_threshold(page, root_selector)
+        scroll_until_views_below_threshold(page, root_selector, watchdog_cb=_scrape_watchdog)
 
         if DEBUG_SCROLL:
             logger.info("[DEBUG] After scroll_until_views_below_threshold returned")
@@ -1340,7 +1919,10 @@ def process_audio_url(
         if DEBUG_SCROLL:
             logger.info("[DEBUG] After scrape_loaded_items: rows=%s grid_count=%s", len(output_rows), grid_count)
         return output_rows, grid_count
-        
+
+    except SongSkippedByUserError:
+        raise
+
     except Exception as e:
         logger.error("Error processing %s: %s", song_name, e)
         # Check if it's a captcha/block issue
@@ -1396,6 +1978,13 @@ def main():
         logger.error("Failed to ensure output link column: %s", e)
         return
 
+    # Update Spotify release dates (B -> C) before processing TikTok URLs.
+    try:
+        updated_release_dates = update_spotify_release_dates(sheets_svc, input_spreadsheet_id)
+        logger.info("Spotify release date rows updated: %s", updated_release_dates)
+    except Exception as e:
+        logger.warning("Spotify release date update failed; continuing: %s", e)
+
     # Get input rows
     try:
         input_rows = get_input_rows(sheets_svc, input_spreadsheet_id)
@@ -1443,6 +2032,7 @@ def main():
                 "elapsed_seconds": 0.0,
                 "grid_items_loaded_count": 0,
                 VIDEOS_KEPT_FIELD: 0,
+                "spike_rows_marked": 0,
                 "output_sheet_url": "",
                 "status": "failed",
                 "error_message": "",
@@ -1466,6 +2056,7 @@ def main():
                     drive_svc, sheets_svc, output_title
                 )
                 append_rows_to_output_sheet(sheets_svc, output_spreadsheet_id, output_rows)
+                stat["spike_rows_marked"] = postprocess_output_sheet(sheets_svc, output_spreadsheet_id)
                 write_output_link_back(sheets_svc, input_spreadsheet_id, row_index, output_url)
 
                 stat["output_sheet_url"] = output_url
@@ -1475,6 +2066,15 @@ def main():
                 run_stats.append(stat)
                 pbar.set_postfix_str("%s | %s v | %ss" % (song_name[:18], n_videos, int(stat["elapsed_seconds"])))
                 logger.info("Completed %s: %s videos -> %s", song_name, n_videos, output_url)
+
+            except SongSkippedByUserError as err:
+                stat["status"] = "failed"
+                stat["error_message"] = str(err)[:200]
+                stat["end_ts"] = time.perf_counter()
+                stat["elapsed_seconds"] = stat["end_ts"] - start_ts
+                run_stats.append(stat)
+                pbar.set_postfix_str("%s | FAIL | %ss" % (song_name[:18], int(stat["elapsed_seconds"])))
+                logger.error("Skipped %s by user: %s", song_name, err)
 
             except Exception as err:
                 stat["status"] = "failed"
@@ -1496,6 +2096,7 @@ def main():
     n_fail = sum(1 for s in run_stats if s["status"] == "failed")
     n_no_videos = sum(1 for s in run_stats if s["status"] == "no_videos")
     total_videos = sum(s[VIDEOS_KEPT_FIELD] for s in run_stats)
+    total_spike_rows_marked = sum(int(s.get("spike_rows_marked", 0) or 0) for s in run_stats)
     avg_time = total_elapsed / len(run_stats) if run_stats else 0.0
     slowest = sorted(run_stats, key=lambda s: s["elapsed_seconds"], reverse=True)[:3]
 
@@ -1508,6 +2109,7 @@ def main():
         "  Success: %s  |  No videos: %s  |  Failed: %s" % (n_ok, n_no_videos, n_fail),
         "Total runtime: %s" % _format_elapsed(total_elapsed),
         "Total videos (>= %s): %s" % (VIEWS_THRESHOLD_LABEL, total_videos),
+        "Total spike rows marked green: %s" % total_spike_rows_marked,
         "Avg time per song: %s" % _format_elapsed(avg_time),
         "Slowest 3:",
     ]
@@ -1518,11 +2120,12 @@ def main():
         ))
     lines.append("")
     for s in run_stats:
-        lines.append("[%s] %s  %s  %s videos  %s  %s" % (
+        lines.append("[%s] %s  %s  %s videos  %s spikes  %s  %s" % (
             s["status"],
             s["song_name"][:35],
             _format_elapsed(s["elapsed_seconds"]),
             s[VIDEOS_KEPT_FIELD],
+            int(s.get("spike_rows_marked", 0) or 0),
             s["output_sheet_url"] or "-",
             (" " + s["error_message"][:60]) if s["error_message"] else "",
         ))
