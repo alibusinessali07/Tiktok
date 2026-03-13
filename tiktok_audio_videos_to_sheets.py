@@ -47,10 +47,23 @@ import requests
 from tqdm import tqdm
 
 # Input / auth
-INPUT_SHEET_URL = os.getenv(
-    "INPUT_SHEET_URL",
+DEFAULT_INPUT_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1bWlvp89BtbsMYs4wiW-XFeUB8RK8bPGwHz_YfQXHunU/edit?usp=sharing"
 )
+DEFAULT_TEST_INPUT_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/1AGFFwTjEU0A2UalFaMHBRCjDWUALe2-kLRqbw7YvyYY/edit?gid=0#gid=0"
+)
+
+
+def _env_bool(var_name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(var_name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+TEST_MODE_ENABLED = _env_bool("ENABLE_TESTING_MODE", True) #Dont change this
+PROD_INPUT_SHEET_URL = os.getenv("INPUT_SHEET_URL", DEFAULT_INPUT_SHEET_URL)
+TEST_INPUT_SHEET_URL = os.getenv("TEST_INPUT_SHEET_URL", DEFAULT_TEST_INPUT_SHEET_URL)
+INPUT_SHEET_URL = TEST_INPUT_SHEET_URL if TEST_MODE_ENABLED else PROD_INPUT_SHEET_URL
 AUTH_FILE = Path(__file__).parent / "auto_auth.json"
 SPOTIFY_SECRET_FILE = Path(__file__).parent / "spotify_secret.json"
 PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
@@ -78,8 +91,9 @@ def _format_threshold_label(value: int) -> str:
         return f"{value // 1_000}k"
     return f"{value:,}"
 
-
-VIEWS_THRESHOLD = 100 # 100 view is enough to be considered a video
+PROD_VIEWS_THRESHOLD = 100
+TEST_VIEWS_THRESHOLD = 10000
+VIEWS_THRESHOLD = TEST_VIEWS_THRESHOLD if TEST_MODE_ENABLED else PROD_VIEWS_THRESHOLD
 VIEWS_THRESHOLD_LABEL = _format_threshold_label(VIEWS_THRESHOLD)
 VIDEOS_KEPT_FIELD = "videos_kept_ge_threshold"
 MAX_SCROLLS = 200000
@@ -174,14 +188,19 @@ OUTPUT_COLUMNS = [
     "duration",
     "upload_date",
     "upload_time",
+    "upload_datetime",
 ]
 OUTPUT_COL_IDX_VIDEO_LINK = OUTPUT_COLUMNS.index("video_link")
 OUTPUT_COL_IDX_VIEWS = OUTPUT_COLUMNS.index("views")
 OUTPUT_COL_IDX_SAVES = OUTPUT_COLUMNS.index("saves")
 OUTPUT_COL_IDX_UPLOAD_DATE = OUTPUT_COLUMNS.index("upload_date")
+OUTPUT_COL_IDX_UPLOAD_TIME = OUTPUT_COLUMNS.index("upload_time")
+OUTPUT_COL_IDX_UPLOAD_DATETIME = OUTPUT_COLUMNS.index("upload_datetime")
 OUTPUT_COLUMNS_COUNT = len(OUTPUT_COLUMNS)
 SPIKE_Q1_QUANTILE = 0.25
 SPIKE_Q3_QUANTILE = 0.90
+PLOT_DATA_SHEET_TITLE = "Daily Plot Data"
+PLOT_CHART_SHEET_TITLE = "Daily Plot"
 
 # Google API scopes
 SCOPES = [
@@ -596,7 +615,7 @@ def _format_output_count_columns(
     spreadsheet_id: str,
     apply_filter: bool = False,
 ) -> None:
-    """Apply output sheet formats (D:H counts, I duration, J date, K time)."""
+    """Apply output sheet formats (D:H counts, I duration, J date, K time, L datetime)."""
     try:
         meta = sheets_svc.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
@@ -695,6 +714,25 @@ def _format_output_count_columns(
                     "fields": "userEnteredFormat.numberFormat",
                 }
             },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,    # skip header row
+                        "startColumnIndex": OUTPUT_COL_IDX_UPLOAD_DATETIME,
+                        "endColumnIndex": OUTPUT_COL_IDX_UPLOAD_DATETIME + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "DATE_TIME",
+                                "pattern": "m/d/yyyy h:mm:ss AM/PM",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            },
         ]
 
         if apply_filter:
@@ -758,7 +796,7 @@ def _append_rows_to_output_sheet_impl(
 def postprocess_output_sheet(sheets_svc, spreadsheet_id: str) -> int:
     """
     Post-process one generated output sheet:
-    1) Sort rows by upload_date descending (Z->A).
+    1) Sort rows by upload_datetime descending (Z->A).
     2) Detect spikes in views/saves using IQR-style thresholds.
     3) Mark spike rows green.
 
@@ -789,9 +827,10 @@ def _read_output_rows_unformatted(
     sheet_title: str,
 ) -> List[List[Any]]:
     safe_title = sheet_title.replace("'", "''")
+    last_col = _column_index_to_a1_label(OUTPUT_COLUMNS_COUNT - 1)
     result = sheets_svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"'{safe_title}'!A2:K",
+        range=f"'{safe_title}'!A2:{last_col}",
         valueRenderOption="UNFORMATTED_VALUE",
         dateTimeRenderOption="SERIAL_NUMBER",
     ).execute()
@@ -830,14 +869,16 @@ def _quantile_linear(values: List[float], q: float) -> float:
     return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac)
 
 
-def _serial_to_iso_date(value: Any) -> str:
+def _serial_to_iso_datetime(value: Any) -> str:
     serial = _to_float(value)
     if serial is None:
         s = str(value or "").strip()
         return s
     try:
-        day_number = int(serial)
-        return (_SHEETS_EPOCH_DATE + dt.timedelta(days=day_number)).isoformat()
+        serial_day = int(serial)
+        frac = float(serial - serial_day)
+        dt_value = dt.datetime.combine(_SHEETS_EPOCH_DATE + dt.timedelta(days=serial_day), dt.time()) + dt.timedelta(days=frac)
+        return dt_value.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(value)
 
@@ -857,6 +898,172 @@ def _contiguous_ranges(sorted_indices: List[int]) -> List[Tuple[int, int]]:
     return ranges
 
 
+def _column_index_to_a1_label(col_idx_0_based: int) -> str:
+    """Convert 0-based column index to A1 column label (0->A, 25->Z, 26->AA)."""
+    if col_idx_0_based < 0:
+        raise ValueError("Column index must be >= 0")
+    n = col_idx_0_based + 1
+    chars: List[str] = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        chars.append(chr(ord("A") + rem))
+    return "".join(reversed(chars))
+
+
+def create_daily_plot_tabs(sheets_svc, spreadsheet_id: str) -> None:
+    """
+    Create/refresh the chart tab in one output spreadsheet.
+    Chart series source ranges point directly to the primary output sheet.
+    """
+    _create_daily_plot_tabs_impl(sheets_svc, spreadsheet_id)
+
+
+def _create_daily_plot_tabs_impl(sheets_svc, spreadsheet_id: str) -> None:
+    primary_sheet_id, primary_sheet_title = _get_primary_sheet_props(sheets_svc, spreadsheet_id)
+    rows = _read_output_rows_unformatted(sheets_svc, spreadsheet_id, primary_sheet_title)
+    if not rows:
+        logger.info("Daily plot skipped (%s): no data rows", spreadsheet_id)
+        return
+
+    meta = sheets_svc.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    existing_ids: Dict[str, int] = {}
+    for sheet in meta.get("sheets", []):
+        props = sheet.get("properties", {})
+        sheet_id = props.get("sheetId")
+        title = str(props.get("title") or "")
+        if sheet_id is None or not title:
+            continue
+        existing_ids[title] = int(sheet_id)
+
+    for reserved_title in (PLOT_DATA_SHEET_TITLE, PLOT_CHART_SHEET_TITLE):
+        if existing_ids.get(reserved_title) == primary_sheet_id:
+            raise ValueError(f"Cannot create '{reserved_title}' tab because primary sheet uses this title")
+
+    setup_requests: List[Dict[str, Any]] = []
+    for title in (PLOT_DATA_SHEET_TITLE, PLOT_CHART_SHEET_TITLE):
+        existing_id = existing_ids.get(title)
+        if existing_id is not None:
+            setup_requests.append({"deleteSheet": {"sheetId": existing_id}})
+
+    setup_requests.append({"addSheet": {"properties": {"title": PLOT_CHART_SHEET_TITLE}}})
+
+    sheets_svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": setup_requests},
+    ).execute()
+
+    refreshed = sheets_svc.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    chart_sheet_id: Optional[int] = None
+    for sheet in refreshed.get("sheets", []):
+        props = sheet.get("properties", {})
+        title = str(props.get("title") or "")
+        sheet_id = props.get("sheetId")
+        if sheet_id is None:
+            continue
+        if title == PLOT_CHART_SHEET_TITLE:
+            chart_sheet_id = int(sheet_id)
+
+    if chart_sheet_id is None:
+        raise ValueError("Failed to resolve sheet ID for daily plot chart tab")
+
+    end_row = len(rows) + 1  # include header row from primary sheet
+    chart_request = {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": f"Views and Saves over Upload DateTime ({primary_sheet_title})",
+                    "basicChart": {
+                        "chartType": "LINE",
+                        "legendPosition": "TOP_LEGEND",
+                        "headerCount": 1,
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": "Upload DateTime"},
+                            {"position": "LEFT_AXIS", "title": "Views"},
+                            {"position": "RIGHT_AXIS", "title": "Saves"},
+                        ],
+                        "domains": [
+                            {
+                                "domain": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": primary_sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": end_row,
+                                                "startColumnIndex": OUTPUT_COL_IDX_UPLOAD_DATETIME,
+                                                "endColumnIndex": OUTPUT_COL_IDX_UPLOAD_DATETIME + 1,
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        ],
+                        "series": [
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": primary_sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": end_row,
+                                                "startColumnIndex": OUTPUT_COL_IDX_VIEWS,
+                                                "endColumnIndex": OUTPUT_COL_IDX_VIEWS + 1,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "LEFT_AXIS",
+                            },
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": primary_sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": end_row,
+                                                "startColumnIndex": OUTPUT_COL_IDX_SAVES,
+                                                "endColumnIndex": OUTPUT_COL_IDX_SAVES + 1,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "RIGHT_AXIS",
+                            },
+                        ],
+                    },
+                },
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {"sheetId": chart_sheet_id, "rowIndex": 0, "columnIndex": 0},
+                        "offsetXPixels": 20,
+                        "offsetYPixels": 20,
+                        "widthPixels": 1200,
+                        "heightPixels": 600,
+                    }
+                },
+            }
+        }
+    }
+    sheets_svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [chart_request]},
+    ).execute()
+
+    logger.info(
+        "Created daily plot tab in %s using canonical upload_datetime column (%s rows)",
+        spreadsheet_id,
+        len(rows),
+    )
+
+
 def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
     sheet_id, sheet_title = _get_primary_sheet_props(sheets_svc, spreadsheet_id)
 
@@ -865,7 +1072,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
         logger.info("Post-process skipped (%s): no data rows", spreadsheet_id)
         return 0
 
-    # Sort uploaded rows by upload_date (column J) descending = Z->A.
+    # Sort uploaded rows by upload_datetime (column L) descending = Z->A.
     sort_request = {
         "sortRange": {
             "range": {
@@ -877,7 +1084,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
             },
             "sortSpecs": [
                 {
-                    "dimensionIndex": OUTPUT_COL_IDX_UPLOAD_DATE,
+                    "dimensionIndex": OUTPUT_COL_IDX_UPLOAD_DATETIME,
                     "sortOrder": "DESCENDING",
                 }
             ],
@@ -887,7 +1094,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
         spreadsheetId=spreadsheet_id,
         body={"requests": [sort_request]},
     ).execute()
-    logger.info("Sorted output sheet by upload_date Z->A: %s", spreadsheet_id)
+    logger.info("Sorted output sheet by upload_datetime Z->A: %s", spreadsheet_id)
 
     rows_after_sort = _read_output_rows_unformatted(sheets_svc, spreadsheet_id, sheet_title)
     if not rows_after_sort:
@@ -899,7 +1106,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
         video_link = str(row[OUTPUT_COL_IDX_VIDEO_LINK]).strip() if len(row) > OUTPUT_COL_IDX_VIDEO_LINK else ""
         views = _to_float(row[OUTPUT_COL_IDX_VIEWS] if len(row) > OUTPUT_COL_IDX_VIEWS else 0) or 0.0
         saves = _to_float(row[OUTPUT_COL_IDX_SAVES] if len(row) > OUTPUT_COL_IDX_SAVES else 0) or 0.0
-        upload_date = row[OUTPUT_COL_IDX_UPLOAD_DATE] if len(row) > OUTPUT_COL_IDX_UPLOAD_DATE else ""
+        upload_datetime = row[OUTPUT_COL_IDX_UPLOAD_DATETIME] if len(row) > OUTPUT_COL_IDX_UPLOAD_DATETIME else ""
         if not video_link:
             continue
         records.append(
@@ -908,7 +1115,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
                 "video_link": video_link,
                 "views": float(views),
                 "saves": float(saves),
-                "upload_date": upload_date,
+                "upload_datetime": upload_datetime,
             }
         )
 
@@ -958,7 +1165,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
         logger.info(
             "SPIKE [%s] %s | %s | views=%s | saves=%s",
             rec["spike_type"],
-            _serial_to_iso_date(rec["upload_date"]),
+            _serial_to_iso_datetime(rec["upload_datetime"]),
             rec["video_link"],
             int(round(rec["views"])),
             int(round(rec["saves"])),
@@ -1243,6 +1450,19 @@ def parse_time_to_day_fraction(value: Any) -> Any:
         return ""
     total_seconds = parsed_time.hour * 3600 + parsed_time.minute * 60 + parsed_time.second
     return total_seconds / 86400.0
+
+
+def combine_date_and_time_serial(upload_date: Any, upload_time: Any) -> Any:
+    """Combine Sheets serial date + time fraction into one datetime serial."""
+    date_serial = _to_float(upload_date)
+    if date_serial is None:
+        return ""
+    time_fraction = _to_float(upload_time)
+    if time_fraction is None:
+        time_fraction = 0.0
+    if time_fraction >= 1.0 or time_fraction <= -1.0:
+        time_fraction = time_fraction - int(time_fraction)
+    return float(int(date_serial) + float(time_fraction))
 
 
 # ============================================================================
@@ -1824,6 +2044,7 @@ def scrape_loaded_items(
             duration = parse_duration_to_day_fraction(row.get("duration", ""))
             upload_date = parse_date_to_serial(row.get("upload_date", ""))
             upload_time = parse_time_to_day_fraction(row.get("upload_time", ""))
+            upload_datetime = combine_date_and_time_serial(upload_date, upload_time)
             output_rows.append([
                 video_link,
                 username,
@@ -1836,6 +2057,7 @@ def scrape_loaded_items(
                 duration,
                 upload_date,
                 upload_time,
+                upload_datetime,
             ])
         except Exception as e:
             logger.warning("Error scraping item %s: %s", idx, e)
@@ -1952,6 +2174,11 @@ def main():
     logger.info("TikTok Audio Videos to Sheets Scraper")
     logger.info("="*70)
     logger.info("Log file: %s", log_path)
+    logger.info("Testing mode enabled: %s", TEST_MODE_ENABLED)
+    logger.info(
+        "Input sheet URL source: %s",
+        "TEST_INPUT_SHEET_URL" if TEST_MODE_ENABLED else "INPUT_SHEET_URL",
+    )
 
     run_stats: List[Dict[str, Any]] = []
     total_start = time.perf_counter()
@@ -2058,6 +2285,14 @@ def main():
                 append_rows_to_output_sheet(sheets_svc, output_spreadsheet_id, output_rows)
                 stat["spike_rows_marked"] = postprocess_output_sheet(sheets_svc, output_spreadsheet_id)
                 write_output_link_back(sheets_svc, input_spreadsheet_id, row_index, output_url)
+                try:
+                    create_daily_plot_tabs(sheets_svc, output_spreadsheet_id)
+                except Exception as chart_err:
+                    logger.warning(
+                        "Could not create daily plot tabs for %s: %s",
+                        output_spreadsheet_id,
+                        chart_err,
+                    )
 
                 stat["output_sheet_url"] = output_url
                 stat["status"] = "success"
