@@ -1,13 +1,17 @@
-# TikTok Scraper Requirements
+# Project requirements
 # Install with: pip install -r requirements.txt
 
-# Main TikTok Scraper (tiktok.py)
-playwright>=1.45.0
+# Google Sheets / auth
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
+
+# Browser automation / scraping
+playwright>=1.45.0
+requests>=2.31.0
+tqdm>=4.66.0
+
+# Timezone support
 pytz>=2023.3
 
-# Daily Scheduler (daily_scheduler.py)
-schedule>=1.2.0
-requests>=2.31.0
-gdown>=4.7.1
+# Notebook helper
+pandas>=2.2.0
