@@ -1,7 +1,7 @@
 """
 TikTok Audio Videos to Google Sheets Scraper
 
-This script reads a Google Sheet with Song Name and TikTok Audio URL columns,
+This script reads a Google Sheet with Song Name, Version, and TikTok Audio URL columns,
 scrapes videos from each audio page, and creates output sheets with video data.
 After writing each output sheet, it sorts rows by upload_date (Z->A), detects
 views/saves spikes, and colors spike rows green.
@@ -69,15 +69,21 @@ SPOTIFY_SECRET_FILE = Path(__file__).parent / "spotify_secret.json"
 PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
 
 # Input sheet expected columns:
-# A: Song Name | B: Spotify Audio URL | C: Spotify Release Date | D: Tiktok Audio URL | E: Output Link
+# A: Song Name | B: Version |
+# C: Spotify Audio URL (optional for non-original versions) |
+# D: Spotify Release Date (optional) |
+# E: Tiktok Audio URL | F: Output Link
 INPUT_COL_SONG_NAME = 0
-INPUT_COL_TIKTOK_AUDIO_URL = 3
-INPUT_COL_OUTPUT_LINK = 4
+INPUT_COL_VERSION = 1
+INPUT_COL_SPOTIFY_AUDIO_URL = 2
+INPUT_COL_SPOTIFY_RELEASE_DATE = 3
+INPUT_COL_TIKTOK_AUDIO_URL = 4
+INPUT_COL_OUTPUT_LINK = 5
 INPUT_HEADER_SONG_NAME = "song name"
+INPUT_HEADER_VERSION = "version"
 INPUT_HEADER_TIKTOK_AUDIO_URLS = {"tiktok audio url", "tik tok audio url"}
 INPUT_HEADER_OUTPUT_LINK = "output link"
-INPUT_COL_SPOTIFY_AUDIO_URL = 1
-INPUT_COL_SPOTIFY_RELEASE_DATE = 2
+DEFAULT_SONG_VERSION = "original"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 SPOTIFY_HTTP_TIMEOUT_SEC = 20
@@ -177,6 +183,7 @@ _SCRAPE_ROWS_JS = """(args) => {
 
 # Output schema
 OUTPUT_COLUMNS = [
+    "version",
     "video_link",
     "username",
     "profile_link",
@@ -193,10 +200,13 @@ OUTPUT_COLUMNS = [
 OUTPUT_COL_IDX_VIDEO_LINK = OUTPUT_COLUMNS.index("video_link")
 OUTPUT_COL_IDX_VIEWS = OUTPUT_COLUMNS.index("views")
 OUTPUT_COL_IDX_SAVES = OUTPUT_COLUMNS.index("saves")
+OUTPUT_COL_IDX_SHARES_REPOSTS = OUTPUT_COLUMNS.index("shares_reposts")
+OUTPUT_COL_IDX_DURATION = OUTPUT_COLUMNS.index("duration")
 OUTPUT_COL_IDX_UPLOAD_DATE = OUTPUT_COLUMNS.index("upload_date")
 OUTPUT_COL_IDX_UPLOAD_TIME = OUTPUT_COLUMNS.index("upload_time")
 OUTPUT_COL_IDX_UPLOAD_DATETIME = OUTPUT_COLUMNS.index("upload_datetime")
 OUTPUT_COLUMNS_COUNT = len(OUTPUT_COLUMNS)
+OUTPUT_PRIMARY_SHEET_TITLE = "Data"
 SPIKE_Q1_QUANTILE = 0.25
 SPIKE_Q3_QUANTILE = 0.90
 PLOT_DATA_SHEET_TITLE = "Daily Plot Data"
@@ -243,6 +253,11 @@ def setup_logging(log_file_path: Path) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_song_version(value: Any) -> str:
+    version = str(value).strip()
+    return version or DEFAULT_SONG_VERSION
 
 
 class SongSkippedByUserError(Exception):
@@ -399,14 +414,16 @@ def _fetch_spotify_release_date(spotify_url: str) -> Optional[str]:
 def update_spotify_release_dates(sheets_svc, spreadsheet_id: str) -> int:
     """
     For each input row:
-      - Read Spotify URL from column B
+      - Read Spotify URL from Spotify URL column
       - Resolve release date via Spotify API
-      - Write release date to column C
+      - Write release date to Spotify Release Date column
+      - Skip rows with blank Spotify URL
     Returns number of rows updated.
     """
+    release_col_label = _column_index_to_a1_label(INPUT_COL_SPOTIFY_RELEASE_DATE)
     result = sheets_svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range="A:C",
+        range=f"A:{release_col_label}",
     ).execute()
     values = result.get("values", [])
     if not values:
@@ -437,7 +454,7 @@ def update_spotify_release_dates(sheets_svc, spreadsheet_id: str) -> int:
         if not release_date:
             continue
 
-        updates.append({"range": f"C{row_index}", "values": [[release_date]]})
+        updates.append({"range": f"{release_col_label}{row_index}", "values": [[release_date]]})
 
     if not updates:
         logger.info("Spotify release date update: no rows needed updates")
@@ -458,10 +475,11 @@ def update_spotify_release_dates(sheets_svc, spreadsheet_id: str) -> int:
 def get_input_rows(sheets_svc, spreadsheet_id: str) -> List[Dict]:
     """
     Read input rows using current schema:
-      A Song Name, B Spotify Audio URL, C Spotify Release Date,
-      D Tiktok Audio URL, E Output Link.
+      A Song Name, B Version, C Spotify Audio URL,
+      D Spotify Release Date, E Tiktok Audio URL, F Output Link.
+      Spotify columns may be blank for non-original versions.
     Return list of:
-      {song_name, audio_url, spotify_audio_url, spotify_release_date, row_index}
+      {song_name, version, audio_url, spotify_audio_url, spotify_release_date, row_index}
     where row_index is 1-based.
     """
     return _get_input_rows_impl(sheets_svc, spreadsheet_id)
@@ -469,9 +487,10 @@ def get_input_rows(sheets_svc, spreadsheet_id: str) -> List[Dict]:
 
 def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
     try:
+        input_last_col_label = _column_index_to_a1_label(INPUT_COL_OUTPUT_LINK)
         result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range="A:E"  # Read Song Name through Output Link
+            range=f"A:{input_last_col_label}"  # Read Song Name through Output Link
         ).execute()
         
         values = result.get("values", [])
@@ -487,9 +506,17 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
                 INPUT_HEADER_SONG_NAME,
                 header[INPUT_COL_SONG_NAME] if len(header) > INPUT_COL_SONG_NAME else "",
             )
+        if len(header_norm) > INPUT_COL_VERSION and header_norm[INPUT_COL_VERSION] != INPUT_HEADER_VERSION:
+            logger.warning(
+                "Input header %s1 expected '%s' but found '%s'",
+                _column_index_to_a1_label(INPUT_COL_VERSION),
+                INPUT_HEADER_VERSION,
+                header[INPUT_COL_VERSION] if len(header) > INPUT_COL_VERSION else "",
+            )
         if len(header_norm) > INPUT_COL_TIKTOK_AUDIO_URL and header_norm[INPUT_COL_TIKTOK_AUDIO_URL] not in INPUT_HEADER_TIKTOK_AUDIO_URLS:
             logger.warning(
-                "Input header D1 expected one of %s but found '%s'",
+                "Input header %s1 expected one of %s but found '%s'",
+                _column_index_to_a1_label(INPUT_COL_TIKTOK_AUDIO_URL),
                 sorted(INPUT_HEADER_TIKTOK_AUDIO_URLS),
                 header[INPUT_COL_TIKTOK_AUDIO_URL] if len(header) > INPUT_COL_TIKTOK_AUDIO_URL else "",
             )
@@ -505,6 +532,7 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
             
             rows.append({
                 "song_name": str(row[INPUT_COL_SONG_NAME]).strip(),
+                "version": normalize_song_version(row[INPUT_COL_VERSION] if len(row) > INPUT_COL_VERSION else ""),
                 "audio_url": str(row[INPUT_COL_TIKTOK_AUDIO_URL]).strip(),
                 "spotify_audio_url": str(row[INPUT_COL_SPOTIFY_AUDIO_URL]).strip() if len(row) > INPUT_COL_SPOTIFY_AUDIO_URL else "",
                 "spotify_release_date": str(row[INPUT_COL_SPOTIFY_RELEASE_DATE]).strip() if len(row) > INPUT_COL_SPOTIFY_RELEASE_DATE else "",
@@ -520,7 +548,7 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
 
 
 def ensure_output_link_column(sheets_svc, spreadsheet_id: str) -> None:
-    """Ensure header row has 'Output Link' in column E."""
+    """Ensure header row has 'Output Link' in the configured output-link column."""
     _ensure_output_link_column_impl(sheets_svc, spreadsheet_id)
 
 
@@ -533,8 +561,9 @@ def _ensure_output_link_column_impl(sheets_svc, spreadsheet_id: str) -> None:
         ).execute()
         
         headers = result.get("values", [[]])[0] if result.get("values") else []
+        output_col_label = _column_index_to_a1_label(INPUT_COL_OUTPUT_LINK)
         
-        # Ensure Output Link is at column E (index 4)
+        # Ensure Output Link is at configured output-link column.
         while len(headers) <= INPUT_COL_OUTPUT_LINK:
             headers.append("")
 
@@ -548,9 +577,9 @@ def _ensure_output_link_column_impl(sheets_svc, spreadsheet_id: str) -> None:
                 body={"values": [headers]}
             ).execute()
             
-            logger.info("Set 'Output Link' header in column E")
+            logger.info("Set 'Output Link' header in column %s", output_col_label)
         else:
-            logger.info("'Output Link' header already exists in column E")
+            logger.info("'Output Link' header already exists in column %s", output_col_label)
             
     except HttpError as e:
         logger.error("Error ensuring output link column: %s", e)
@@ -572,9 +601,10 @@ def _create_output_spreadsheet_impl(
     title: str
 ) -> Tuple[str, str]:
     try:
-        # Create spreadsheet
+        # Create spreadsheet with primary data tab title.
         spreadsheet = {
-            "properties": {"title": title}
+            "properties": {"title": title},
+            "sheets": [{"properties": {"title": OUTPUT_PRIMARY_SHEET_TITLE}}],
         }
         
         result = sheets_svc.spreadsheets().create(body=spreadsheet).execute()
@@ -589,7 +619,7 @@ def _create_output_spreadsheet_impl(
             body={"values": [OUTPUT_COLUMNS]}
         ).execute()
 
-        # Format D:H as comma-separated numbers and set a header filter (A:last col)
+        # Format output columns and set a header filter (A:last col)
         _format_output_count_columns(sheets_svc, spreadsheet_id, apply_filter=True)
         
         # Set sharing: anyone with link can edit
@@ -615,7 +645,7 @@ def _format_output_count_columns(
     spreadsheet_id: str,
     apply_filter: bool = False,
 ) -> None:
-    """Apply output sheet formats (D:H counts, I duration, J date, K time, L datetime)."""
+    """Apply output sheet formats (counts, duration, date, time, datetime) by output column indices."""
     try:
         meta = sheets_svc.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
@@ -642,9 +672,9 @@ def _format_output_count_columns(
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,   # skip header row
-                        "startColumnIndex": 3, # D
-                        "endColumnIndex": 8,   # H (exclusive)
+                        "startRowIndex": 1,  # skip header row
+                        "startColumnIndex": OUTPUT_COL_IDX_VIEWS,
+                        "endColumnIndex": OUTPUT_COL_IDX_SHARES_REPOSTS + 1,
                     },
                     "cell": {
                         "userEnteredFormat": {
@@ -661,9 +691,9 @@ def _format_output_count_columns(
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,   # skip header row
-                        "startColumnIndex": 8, # I
-                        "endColumnIndex": 9,   # I (exclusive)
+                        "startRowIndex": 1,  # skip header row
+                        "startColumnIndex": OUTPUT_COL_IDX_DURATION,
+                        "endColumnIndex": OUTPUT_COL_IDX_DURATION + 1,
                     },
                     "cell": {
                         "userEnteredFormat": {
@@ -680,9 +710,9 @@ def _format_output_count_columns(
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,   # skip header row
-                        "startColumnIndex": 9, # J
-                        "endColumnIndex": 10,  # J (exclusive)
+                        "startRowIndex": 1,  # skip header row
+                        "startColumnIndex": OUTPUT_COL_IDX_UPLOAD_DATE,
+                        "endColumnIndex": OUTPUT_COL_IDX_UPLOAD_DATE + 1,
                     },
                     "cell": {
                         "userEnteredFormat": {
@@ -699,9 +729,9 @@ def _format_output_count_columns(
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,    # skip header row
-                        "startColumnIndex": 10, # K
-                        "endColumnIndex": 11,   # K (exclusive)
+                        "startRowIndex": 1,  # skip header row
+                        "startColumnIndex": OUTPUT_COL_IDX_UPLOAD_TIME,
+                        "endColumnIndex": OUTPUT_COL_IDX_UPLOAD_TIME + 1,
                     },
                     "cell": {
                         "userEnteredFormat": {
@@ -815,7 +845,7 @@ def _get_primary_sheet_props(sheets_svc, spreadsheet_id: str) -> Tuple[int, str]
         raise ValueError(f"No sheets found in spreadsheet {spreadsheet_id}")
     props = sheets[0].get("properties", {})
     sheet_id = props.get("sheetId")
-    title = props.get("title", "Sheet1")
+    title = props.get("title", OUTPUT_PRIMARY_SHEET_TITLE)
     if sheet_id is None:
         raise ValueError(f"Missing sheetId in spreadsheet {spreadsheet_id}")
     return int(sheet_id), str(title)
@@ -1072,7 +1102,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
         logger.info("Post-process skipped (%s): no data rows", spreadsheet_id)
         return 0
 
-    # Sort uploaded rows by upload_datetime (column L) descending = Z->A.
+    # Sort uploaded rows by upload_datetime descending = Z->A.
     sort_request = {
         "sortRange": {
             "range": {
@@ -1214,10 +1244,11 @@ def _flush_output_link_queue(sheets_svc) -> None:
     for sid, row_index, output_url in _OUTPUT_LINK_QUEUE:
         by_sheet.setdefault(sid, []).append((row_index, output_url))
     _OUTPUT_LINK_QUEUE = []
+    output_col_label = _column_index_to_a1_label(INPUT_COL_OUTPUT_LINK)
     for spreadsheet_id, updates in by_sheet.items():
         try:
             data = [
-                {"range": "E%d" % row_index, "values": [[output_url]]}
+                {"range": f"{output_col_label}{row_index}", "values": [[output_url]]}
                 for row_index, output_url in updates
             ]
             sheets_svc.spreadsheets().values().batchUpdate(
@@ -1248,7 +1279,7 @@ def write_output_link_back(
     row_index: int,
     output_url: str
 ) -> None:
-    """Write output_url to column E at row_index. Uses queue for batching."""
+    """Write output_url to configured output-link column at row_index. Uses queue for batching."""
     queue_output_link(sheets_svc, spreadsheet_id, row_index, output_url, force_flush=False)
 
 
@@ -2020,7 +2051,8 @@ def scroll_until_views_below_threshold(
 def scrape_loaded_items(
     page: Page,
     root_selector: str = MUSIC_LIST,
-    threshold: int = VIEWS_THRESHOLD
+    threshold: int = VIEWS_THRESHOLD,
+    song_version: str = DEFAULT_SONG_VERSION,
 ) -> Tuple[List[List], int]:
     """
     Scrape loaded grid items. Single evaluate. Returns (output rows in OUTPUT_COLUMNS order, grid count).
@@ -2046,6 +2078,7 @@ def scrape_loaded_items(
             upload_time = parse_time_to_day_fraction(row.get("upload_time", ""))
             upload_datetime = combine_date_and_time_serial(upload_date, upload_time)
             output_rows.append([
+                song_version,
                 video_link,
                 username,
                 profile_prefix + username,
@@ -2062,7 +2095,13 @@ def scrape_loaded_items(
         except Exception as e:
             logger.warning("Error scraping item %s: %s", idx, e)
 
-    logger.info("Scraped %s videos (>= %s) from %s grid items", len(output_rows), threshold, grid_count)
+    logger.info(
+        "Scraped %s videos (>= %s) from %s grid items for version '%s'",
+        len(output_rows),
+        threshold,
+        grid_count,
+        song_version,
+    )
     return output_rows, grid_count
 
 
@@ -2081,10 +2120,11 @@ def check_tiktok_blocker(page: Page) -> bool:
 def process_audio_url(
     page: Page,
     audio_url: str,
-    song_name: str
+    song_name: str,
+    song_version: str = DEFAULT_SONG_VERSION,
 ) -> Tuple[List[List], int]:
     """Process audio URL: navigate, scroll, scrape. Return (output rows, grid_count)."""
-    logger.info("Processing: %s", song_name)
+    logger.info("Processing: %s [%s]", song_name, song_version)
     next_watchdog_prompt_at = time.monotonic() + SONG_SCRAPE_PROMPT_INTERVAL_SEC
 
     def _scrape_watchdog() -> None:
@@ -2094,17 +2134,17 @@ def process_audio_url(
             return
 
         prompt = (
-            f"Song '{song_name}' has been scraping for over 15 minutes. "
+            f"Song '{song_name}' version '{song_version}' has been scraping for over 15 minutes. "
             "Continue waiting for this song? [y/n]: "
         )
         while True:
             answer = input(prompt).strip().lower()
             if answer in ("y", "yes"):
                 next_watchdog_prompt_at = time.monotonic() + SONG_SCRAPE_PROMPT_INTERVAL_SEC
-                logger.warning("Continuing scrape for %s for another 15-minute window.", song_name)
+                logger.warning("Continuing scrape for %s [%s] for another 15-minute window.", song_name, song_version)
                 return
             if answer in ("n", "no"):
-                msg = f"Skipped by user after 15-minute scrape window: {song_name}"
+                msg = f"Skipped by user after 15-minute scrape window: {song_name} [{song_version}]"
                 logger.warning(msg)
                 raise SongSkippedByUserError(msg)
             print("Please enter 'y' or 'n'.")
@@ -2136,7 +2176,7 @@ def process_audio_url(
         if DEBUG_SCROLL:
             logger.info("[DEBUG] Before scrape_loaded_items")
 
-        output_rows, grid_count = scrape_loaded_items(page, root_selector)
+        output_rows, grid_count = scrape_loaded_items(page, root_selector, song_version=song_version)
 
         if DEBUG_SCROLL:
             logger.info("[DEBUG] After scrape_loaded_items: rows=%s grid_count=%s", len(output_rows), grid_count)
@@ -2146,7 +2186,7 @@ def process_audio_url(
         raise
 
     except Exception as e:
-        logger.error("Error processing %s: %s", song_name, e)
+        logger.error("Error processing %s [%s]: %s", song_name, song_version, e)
         # Check if it's a captcha/block issue
         if "captcha" in str(e).lower() or "blocked" in str(e).lower():
             logger.warning("Possible captcha or blocking detected")
@@ -2205,7 +2245,7 @@ def main():
         logger.error("Failed to ensure output link column: %s", e)
         return
 
-    # Update Spotify release dates (B -> C) before processing TikTok URLs.
+    # Update Spotify release dates before processing TikTok URLs.
     try:
         updated_release_dates = update_spotify_release_dates(sheets_svc, input_spreadsheet_id)
         logger.info("Spotify release date rows updated: %s", updated_release_dates)
@@ -2231,7 +2271,12 @@ def main():
         logger.warning("No rows to process")
         return
 
-    # Launch browser (reuse for all rows)
+    grouped_rows: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    for row in rows_to_process:
+        grouped_rows.setdefault(row["song_name"], []).append(row)
+    songs_to_process = list(grouped_rows.items())
+
+    # Launch browser (reuse for all songs/versions)
     try:
         playwright, context, page = launch_browser_with_profile()
     except Exception as e:
@@ -2240,20 +2285,19 @@ def main():
 
     try:
         pbar = tqdm(
-            rows_to_process,
+            songs_to_process,
             desc="Processing songs",
             unit="song",
             dynamic_ncols=True,
         )
-        for input_row in pbar:
-            song_name = input_row["song_name"]
-            audio_url = input_row["audio_url"]
-            row_index = input_row["row_index"]
+        for song_name, song_rows in pbar:
+            primary_row = song_rows[0]
             start_ts = time.perf_counter()
             stat: Dict[str, Any] = {
                 "song_name": song_name,
-                "audio_url": audio_url,
-                "row_index": row_index,
+                "audio_url": primary_row["audio_url"],
+                "row_index": primary_row["row_index"],
+                "versions_count": len(song_rows),
                 "start_ts": start_ts,
                 "end_ts": 0.0,
                 "elapsed_seconds": 0.0,
@@ -2265,17 +2309,47 @@ def main():
                 "error_message": "",
             }
             try:
-                output_rows, grid_count = process_audio_url(page, audio_url, song_name)
-                stat["grid_items_loaded_count"] = grid_count
+                output_rows: List[List] = []
+                total_grid_count = 0
+                version_errors: List[str] = []
+
+                for version_row in song_rows:
+                    version_name = normalize_song_version(version_row.get("version", ""))
+                    audio_url = version_row["audio_url"]
+                    try:
+                        version_rows, grid_count = process_audio_url(
+                            page,
+                            audio_url,
+                            song_name,
+                            song_version=version_name,
+                        )
+                        total_grid_count += grid_count
+                        output_rows.extend(version_rows)
+                    except SongSkippedByUserError as err:
+                        version_errors.append(f"{version_name}: {err}")
+                        logger.error("Skipped %s [%s] by user: %s", song_name, version_name, err)
+                    except Exception as err:
+                        version_errors.append(f"{version_name}: {err}")
+                        logger.error("Failed %s [%s]: %s", song_name, version_name, err)
+
+                stat["grid_items_loaded_count"] = total_grid_count
                 n_videos = len(output_rows)
                 stat[VIDEOS_KEPT_FIELD] = n_videos
+                if version_errors:
+                    stat["error_message"] = " | ".join(version_errors)[:200]
 
                 if not output_rows:
-                    stat["status"] = "no_videos"
+                    stat["status"] = "failed" if version_errors else "no_videos"
                     stat["end_ts"] = time.perf_counter()
                     stat["elapsed_seconds"] = stat["end_ts"] - start_ts
                     run_stats.append(stat)
-                    pbar.set_postfix_str("%s | 0 v | %ss" % (song_name[:18], int(stat["elapsed_seconds"])))
+                    pbar.set_postfix_str(
+                        "%s | 0 v | %s vers | %ss" % (
+                            song_name[:16],
+                            len(song_rows),
+                            int(stat["elapsed_seconds"]),
+                        )
+                    )
                     continue
 
                 output_title = f"{song_name} - TikTok Audio Videos"
@@ -2284,7 +2358,13 @@ def main():
                 )
                 append_rows_to_output_sheet(sheets_svc, output_spreadsheet_id, output_rows)
                 stat["spike_rows_marked"] = postprocess_output_sheet(sheets_svc, output_spreadsheet_id)
-                write_output_link_back(sheets_svc, input_spreadsheet_id, row_index, output_url)
+                for version_row in song_rows:
+                    write_output_link_back(
+                        sheets_svc,
+                        input_spreadsheet_id,
+                        version_row["row_index"],
+                        output_url,
+                    )
                 try:
                     create_daily_plot_tabs(sheets_svc, output_spreadsheet_id)
                 except Exception as chart_err:
@@ -2299,17 +2379,21 @@ def main():
                 stat["end_ts"] = time.perf_counter()
                 stat["elapsed_seconds"] = stat["end_ts"] - start_ts
                 run_stats.append(stat)
-                pbar.set_postfix_str("%s | %s v | %ss" % (song_name[:18], n_videos, int(stat["elapsed_seconds"])))
-                logger.info("Completed %s: %s videos -> %s", song_name, n_videos, output_url)
-
-            except SongSkippedByUserError as err:
-                stat["status"] = "failed"
-                stat["error_message"] = str(err)[:200]
-                stat["end_ts"] = time.perf_counter()
-                stat["elapsed_seconds"] = stat["end_ts"] - start_ts
-                run_stats.append(stat)
-                pbar.set_postfix_str("%s | FAIL | %ss" % (song_name[:18], int(stat["elapsed_seconds"])))
-                logger.error("Skipped %s by user: %s", song_name, err)
+                pbar.set_postfix_str(
+                    "%s | %s v | %s vers | %ss" % (
+                        song_name[:16],
+                        n_videos,
+                        len(song_rows),
+                        int(stat["elapsed_seconds"]),
+                    )
+                )
+                logger.info(
+                    "Completed %s: %s videos from %s version(s) -> %s",
+                    song_name,
+                    n_videos,
+                    len(song_rows),
+                    output_url,
+                )
 
             except Exception as err:
                 stat["status"] = "failed"
