@@ -45,6 +45,7 @@ from googleapiclient.errors import HttpError
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Playwright
 import requests
 from tqdm import tqdm
+from chrome_launcher import launch_persistent_chrome_context, resolve_profile_dir
 
 # Input / auth
 DEFAULT_INPUT_SHEET_URL = (
@@ -66,7 +67,7 @@ TEST_INPUT_SHEET_URL = os.getenv("TEST_INPUT_SHEET_URL", DEFAULT_TEST_INPUT_SHEE
 INPUT_SHEET_URL = TEST_INPUT_SHEET_URL if TEST_MODE_ENABLED else PROD_INPUT_SHEET_URL
 AUTH_FILE = Path(__file__).parent / "auto_auth.json"
 SPOTIFY_SECRET_FILE = Path(__file__).parent / "spotify_secret.json"
-PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
+PROFILE_DIR = resolve_profile_dir()
 
 # Input sheet expected columns:
 # A: Song Name | B: Version |
@@ -1290,27 +1291,12 @@ def write_output_link_back(
 def launch_browser_with_profile() -> Tuple[Playwright, BrowserContext, Page]:
     """Launch Chrome persistent context (PROFILE_DIR), extensions enabled. Return (playwright, context, page)."""
     playwright = sync_playwright().start()
-    
-    context = playwright.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        channel="chrome",
-        headless=False,
-        viewport=None,  # No viewport emulation
-        args=[
-            "--window-position=0,0",
-        ],
-        ignore_default_args=[
-            "--enable-automation",
-            "--disable-extensions",  # Prevent Playwright from disabling extensions
-            "--no-sandbox",  # Remove sandbox flag to avoid warnings
-        ],
+    context, page = launch_persistent_chrome_context(
+        playwright,
+        PROFILE_DIR,
+        start_maximized=True,
+        disable_viewport_emulation=True,
     )
-    
-    # Get existing page or create new one
-    if context.pages:
-        page = context.pages[0]
-    else:
-        page = context.new_page()
     
     # Block image/media/font; also block known heavy analytics/tracking (avoid analytics. to not match tiktok.com/analytics)
     _ANALYTICS_DOMAINS = (
@@ -2219,6 +2205,18 @@ def main():
         "Input sheet URL source: %s",
         "TEST_INPUT_SHEET_URL" if TEST_MODE_ENABLED else "INPUT_SHEET_URL",
     )
+    if TEST_MODE_ENABLED:
+        alert = (
+            "\n"
+            + "!" * 70
+            + "\nALERT: TEST MODE IS ENABLED.\n"
+            + f"Using TEST_INPUT_SHEET_URL: {TEST_INPUT_SHEET_URL}\n"
+            + "Set ENABLE_TESTING_MODE=0 to run against production input.\n"
+            + "!" * 70
+            + "\n"
+        )
+        print(alert)
+        logger.warning("ALERT: test mode enabled; using TEST_INPUT_SHEET_URL")
 
     run_stats: List[Dict[str, Any]] = []
     total_start = time.perf_counter()

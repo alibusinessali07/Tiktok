@@ -19,50 +19,27 @@ Profile directory:
 - The extension persists across runs because both scripts share the same profile
 """
 
-import os
-from pathlib import Path
 from playwright.sync_api import sync_playwright
+from chrome_launcher import launch_persistent_chrome_context, resolve_profile_dir
 
 
 def main():
     # Get persistent profile directory from environment or use default
     # MUST be the same PROFILE_DIR used by open_chrome_profile_for_extension_install.py
     # Convert to absolute path to ensure we're using the exact same profile
-    PROFILE_DIR = Path(os.getenv("CHROME_EXTENSION_PROFILE", "./chrome_profile_tiktok_sorter")).resolve()
+    PROFILE_DIR = resolve_profile_dir()
     
     print("Using PROFILE_DIR:", PROFILE_DIR)
     print("If you still see fixed sizing, close all Chrome windows for this profile and rerun.\n")
     
     with sync_playwright() as p:
-        # Launch Chrome with persistent context using the same profile
-        # Extension should already be installed from the manual install script
-        # ignore_default_args removes Playwright's extension-blocking and sandbox flags
-        # viewport=None ensures Playwright does not emulate a fixed viewport
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            channel="chrome",
-            headless=False,
-            viewport=None,  # No viewport emulation - allows normal window resizing
-            args=[
-                "--window-position=0,0",
-                "--window-size=1920,1080",
-            ],
-            ignore_default_args=[
-                "--enable-automation",
-                "--disable-extensions",  # Prevent Playwright from disabling extensions
-                "--no-sandbox",  # Remove sandbox flag to avoid warnings
-            ],
+        # Launch Chrome using shared launcher configuration.
+        context, _ = launch_persistent_chrome_context(
+            p,
+            PROFILE_DIR,
+            start_maximized=True,
+            disable_viewport_emulation=True,
         )
-        
-        # Get existing page or create new one
-        if context.pages:
-            page = context.pages[0]
-        else:
-            page = context.new_page()
-        
-        # Set viewport size as fallback if window sizing is still stuck
-        # This is only needed if viewport=None alone doesn't work
-        page.set_viewport_size({"width": 1920, "height": 1080})
         
         print("\n" + "="*70)
         print("Chrome browser is now running with Playwright automation.")
