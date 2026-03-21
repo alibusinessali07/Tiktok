@@ -61,7 +61,7 @@ def _env_bool(var_name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
-TEST_MODE_ENABLED = _env_bool("ENABLE_TESTING_MODE", True) #Dont change this
+TEST_MODE_ENABLED = _env_bool("ENABLE_TESTING_MODE", False) #Dont change this
 PROD_INPUT_SHEET_URL = os.getenv("INPUT_SHEET_URL", DEFAULT_INPUT_SHEET_URL)
 TEST_INPUT_SHEET_URL = os.getenv("TEST_INPUT_SHEET_URL", DEFAULT_TEST_INPUT_SHEET_URL)
 INPUT_SHEET_URL = TEST_INPUT_SHEET_URL if TEST_MODE_ENABLED else PROD_INPUT_SHEET_URL
