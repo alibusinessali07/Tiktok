@@ -32,6 +32,7 @@ import re
 import json
 import logging
 import time
+import sys
 import datetime as dt
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -61,7 +62,24 @@ def _env_bool(var_name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
-TEST_MODE_ENABLED = _env_bool("ENABLE_TESTING_MODE", False) #Dont change this
+def _parse_sheet_bool(value: Any, *, default: bool = True) -> bool:
+    """
+    Parse common "bool-ish" values from Google Sheets cells.
+    Empty/None/unrecognized values fall back to `default` for backward compatibility.
+    """
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if not s:
+        return default
+    if s in {"1", "true", "t", "yes", "y", "on", "run", "go", "enabled"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off", "skip", "disabled"}:
+        return False
+    return default
+
+
+TEST_MODE_ENABLED = _env_bool("ENABLE_TESTING_MODE", True) #Dont change this
 PROD_INPUT_SHEET_URL = os.getenv("INPUT_SHEET_URL", DEFAULT_INPUT_SHEET_URL)
 TEST_INPUT_SHEET_URL = os.getenv("TEST_INPUT_SHEET_URL", DEFAULT_TEST_INPUT_SHEET_URL)
 INPUT_SHEET_URL = TEST_INPUT_SHEET_URL if TEST_MODE_ENABLED else PROD_INPUT_SHEET_URL
@@ -73,17 +91,23 @@ PROFILE_DIR = resolve_profile_dir()
 # A: Song Name | B: Version |
 # C: Spotify Audio URL (optional for non-original versions) |
 # D: Spotify Release Date (optional) |
-# E: Tiktok Audio URL | F: Output Link
+# E: Tiktok Audio URL | F: Output Link |
+# G: Process (whether to run the scraper for this row/version)
+# H: Last Ran (date when this row/version was last successfully processed)
 INPUT_COL_SONG_NAME = 0
 INPUT_COL_VERSION = 1
 INPUT_COL_SPOTIFY_AUDIO_URL = 2
 INPUT_COL_SPOTIFY_RELEASE_DATE = 3
 INPUT_COL_TIKTOK_AUDIO_URL = 4
 INPUT_COL_OUTPUT_LINK = 5
+INPUT_COL_PROCESS = 6
+INPUT_COL_LAST_RAN = 7
 INPUT_HEADER_SONG_NAME = "song name"
 INPUT_HEADER_VERSION = "version"
 INPUT_HEADER_TIKTOK_AUDIO_URLS = {"tiktok audio url", "tik tok audio url"}
 INPUT_HEADER_OUTPUT_LINK = "output link"
+INPUT_HEADER_PROCESS = "process"
+INPUT_HEADER_LAST_RAN = "last ran"
 DEFAULT_SONG_VERSION = "original"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
@@ -254,6 +278,24 @@ def setup_logging(log_file_path: Path) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+
+def graceful_close(message: str, *, pause_if_interactive: bool = True) -> None:
+    """
+    Print a clear message and (optionally) pause so console windows don't instantly close.
+    """
+    try:
+        print(message)
+    except Exception:
+        pass
+
+    # Only pause when run from a real console (e.g., not when started by scheduler/IDE).
+    if pause_if_interactive:
+        try:
+            if getattr(sys.stdin, "isatty", lambda: False)():
+                input("Press Enter to close...")
+        except Exception:
+            pass
 
 
 def normalize_song_version(value: Any) -> str:
@@ -477,10 +519,10 @@ def get_input_rows(sheets_svc, spreadsheet_id: str) -> List[Dict]:
     """
     Read input rows using current schema:
       A Song Name, B Version, C Spotify Audio URL,
-      D Spotify Release Date, E Tiktok Audio URL, F Output Link.
+      D Spotify Release Date, E Tiktok Audio URL, F Output Link, G Process.
       Spotify columns may be blank for non-original versions.
     Return list of:
-      {song_name, version, audio_url, spotify_audio_url, spotify_release_date, row_index}
+      {song_name, version, audio_url, spotify_audio_url, spotify_release_date, process_enabled, row_index}
     where row_index is 1-based.
     """
     return _get_input_rows_impl(sheets_svc, spreadsheet_id)
@@ -488,10 +530,10 @@ def get_input_rows(sheets_svc, spreadsheet_id: str) -> List[Dict]:
 
 def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
     try:
-        input_last_col_label = _column_index_to_a1_label(INPUT_COL_OUTPUT_LINK)
+        input_last_col_label = _column_index_to_a1_label(max(INPUT_COL_OUTPUT_LINK, INPUT_COL_PROCESS))
         result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"A:{input_last_col_label}"  # Read Song Name through Output Link
+            range=f"A:{input_last_col_label}"  # Read Song Name through Process (if present)
         ).execute()
         
         values = result.get("values", [])
@@ -521,6 +563,14 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
                 sorted(INPUT_HEADER_TIKTOK_AUDIO_URLS),
                 header[INPUT_COL_TIKTOK_AUDIO_URL] if len(header) > INPUT_COL_TIKTOK_AUDIO_URL else "",
             )
+
+        if len(header_norm) > INPUT_COL_PROCESS and header_norm[INPUT_COL_PROCESS] != INPUT_HEADER_PROCESS:
+            logger.warning(
+                "Input header %s1 expected '%s' but found '%s'",
+                _column_index_to_a1_label(INPUT_COL_PROCESS),
+                INPUT_HEADER_PROCESS,
+                header[INPUT_COL_PROCESS] if len(header) > INPUT_COL_PROCESS else "",
+            )
         
         rows = []
         for idx, row in enumerate(values[1:], start=2):
@@ -537,6 +587,8 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
                 "audio_url": str(row[INPUT_COL_TIKTOK_AUDIO_URL]).strip(),
                 "spotify_audio_url": str(row[INPUT_COL_SPOTIFY_AUDIO_URL]).strip() if len(row) > INPUT_COL_SPOTIFY_AUDIO_URL else "",
                 "spotify_release_date": str(row[INPUT_COL_SPOTIFY_RELEASE_DATE]).strip() if len(row) > INPUT_COL_SPOTIFY_RELEASE_DATE else "",
+                # `Process` is optional for backward compatibility; treat empty/unknown as enabled.
+                "process_enabled": _parse_sheet_bool(row[INPUT_COL_PROCESS] if len(row) > INPUT_COL_PROCESS else "", default=True),
                 "row_index": idx
             })
         
@@ -551,6 +603,11 @@ def _get_input_rows_impl(sheets_svc, spreadsheet_id: str) -> List[Dict]:
 def ensure_output_link_column(sheets_svc, spreadsheet_id: str) -> None:
     """Ensure header row has 'Output Link' in the configured output-link column."""
     _ensure_output_link_column_impl(sheets_svc, spreadsheet_id)
+
+
+def ensure_process_column(sheets_svc, spreadsheet_id: str) -> None:
+    """Ensure header row has 'Process' in the configured process column."""
+    _ensure_process_column_impl(sheets_svc, spreadsheet_id)
 
 
 def _ensure_output_link_column_impl(sheets_svc, spreadsheet_id: str) -> None:
@@ -584,6 +641,79 @@ def _ensure_output_link_column_impl(sheets_svc, spreadsheet_id: str) -> None:
             
     except HttpError as e:
         logger.error("Error ensuring output link column: %s", e)
+        raise
+
+
+def _ensure_process_column_impl(sheets_svc, spreadsheet_id: str) -> None:
+    try:
+        # Read header row
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range="1:1",  # First row only
+        ).execute()
+
+        headers = result.get("values", [[]])[0] if result.get("values") else []
+        process_col_label = _column_index_to_a1_label(INPUT_COL_PROCESS)
+
+        # Ensure Process is at configured process column.
+        while len(headers) <= INPUT_COL_PROCESS:
+            headers.append("")
+
+        current = str(headers[INPUT_COL_PROCESS]).strip()
+        if current.lower() != INPUT_HEADER_PROCESS:
+            headers[INPUT_COL_PROCESS] = "Process"
+            sheets_svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="1:1",
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ).execute()
+
+            logger.info("Set 'Process' header in column %s", process_col_label)
+        else:
+            logger.info("'Process' header already exists in column %s", process_col_label)
+
+    except HttpError as e:
+        logger.error("Error ensuring process column: %s", e)
+        raise
+
+
+def ensure_last_ran_column(sheets_svc, spreadsheet_id: str) -> None:
+    """Ensure header row has 'Last Ran' in the configured last-ran column."""
+    _ensure_last_ran_column_impl(sheets_svc, spreadsheet_id)
+
+
+def _ensure_last_ran_column_impl(sheets_svc, spreadsheet_id: str) -> None:
+    try:
+        # Read header row
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range="1:1",  # First row only
+        ).execute()
+
+        headers = result.get("values", [[]])[0] if result.get("values") else []
+        last_ran_col_label = _column_index_to_a1_label(INPUT_COL_LAST_RAN)
+
+        # Ensure Last Ran is at configured last-ran column.
+        while len(headers) <= INPUT_COL_LAST_RAN:
+            headers.append("")
+
+        current = str(headers[INPUT_COL_LAST_RAN]).strip()
+        if current.lower() != INPUT_HEADER_LAST_RAN:
+            headers[INPUT_COL_LAST_RAN] = "Last Ran"
+            sheets_svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="1:1",
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ).execute()
+
+            logger.info("Set 'Last Ran' header in column %s", last_ran_col_label)
+        else:
+            logger.info("'Last Ran' header already exists in column %s", last_ran_col_label)
+
+    except HttpError as e:
+        logger.error("Error ensuring last ran column: %s", e)
         raise
 
 
@@ -1231,7 +1361,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
     return len(row_indices_0_based)
 
 
-_OUTPUT_LINK_QUEUE: List[Tuple[str, int, str]] = []  # (spreadsheet_id, row_index, output_url)
+_OUTPUT_LINK_QUEUE: List[Tuple[str, int, str, str]] = []  # (spreadsheet_id, row_index, output_url, last_ran_date)
 _OUTPUT_LINK_BATCH_SIZE = 5
 
 
@@ -1241,17 +1371,19 @@ def _flush_output_link_queue(sheets_svc) -> None:
     if not _OUTPUT_LINK_QUEUE:
         return
     # Group by spreadsheet_id (typically one input sheet for entire run)
-    by_sheet: Dict[str, List[Tuple[int, str]]] = {}
-    for sid, row_index, output_url in _OUTPUT_LINK_QUEUE:
-        by_sheet.setdefault(sid, []).append((row_index, output_url))
+    by_sheet: Dict[str, List[Tuple[int, str, str]]] = {}
+    for sid, row_index, output_url, last_ran_date in _OUTPUT_LINK_QUEUE:
+        by_sheet.setdefault(sid, []).append((row_index, output_url, last_ran_date))
     _OUTPUT_LINK_QUEUE = []
     output_col_label = _column_index_to_a1_label(INPUT_COL_OUTPUT_LINK)
+    last_ran_col_label = _column_index_to_a1_label(INPUT_COL_LAST_RAN)
     for spreadsheet_id, updates in by_sheet.items():
         try:
-            data = [
-                {"range": f"{output_col_label}{row_index}", "values": [[output_url]]}
-                for row_index, output_url in updates
-            ]
+            # Write output link + last-ran date in one batchUpdate call.
+            data = []
+            for row_index, output_url, last_ran_date in updates:
+                data.append({"range": f"{output_col_label}{row_index}", "values": [[output_url]]})
+                data.append({"range": f"{last_ran_col_label}{row_index}", "values": [[last_ran_date]]})
             sheets_svc.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": data}
@@ -1266,10 +1398,11 @@ def queue_output_link(
     spreadsheet_id: str,
     row_index: int,
     output_url: str,
+    last_ran_date: str,
     force_flush: bool = False
 ) -> None:
     """Queue output link write; flush when batch size reached or force_flush."""
-    _OUTPUT_LINK_QUEUE.append((spreadsheet_id, row_index, output_url))
+    _OUTPUT_LINK_QUEUE.append((spreadsheet_id, row_index, output_url, last_ran_date))
     if len(_OUTPUT_LINK_QUEUE) >= _OUTPUT_LINK_BATCH_SIZE or force_flush:
         _flush_output_link_queue(sheets_svc)
 
@@ -1280,8 +1413,16 @@ def write_output_link_back(
     row_index: int,
     output_url: str
 ) -> None:
-    """Write output_url to configured output-link column at row_index. Uses queue for batching."""
-    queue_output_link(sheets_svc, spreadsheet_id, row_index, output_url, force_flush=False)
+    """Write output_url and stamp 'Last Ran' (today) for the row_index. Uses queue for batching."""
+    last_ran_date = dt.datetime.now(CAIRO_TZ).date().isoformat()
+    queue_output_link(
+        sheets_svc,
+        spreadsheet_id,
+        row_index,
+        output_url,
+        last_ran_date=last_ran_date,
+        force_flush=False,
+    )
 
 
 # ============================================================================
@@ -2225,7 +2366,16 @@ def main():
     try:
         sheets_svc, drive_svc = get_google_clients()
     except Exception as e:
-        logger.error("Failed to initialize Google clients: %s", e)
+        if isinstance(e, FileNotFoundError) and "auto_auth.json" in str(e).lower():
+            msg = (
+                f"Missing service account file: {AUTH_FILE}\n"
+                "Place `auto_auth.json` next to `tiktok_audio_videos_to_sheets.py`, "
+                "then re-run the script."
+            )
+            logger.error("%s", msg)
+            graceful_close(msg)
+        else:
+            logger.error("Failed to initialize Google clients: %s", e)
         return
 
     # Extract input spreadsheet ID
@@ -2241,6 +2391,20 @@ def main():
         ensure_output_link_column(sheets_svc, input_spreadsheet_id)
     except Exception as e:
         logger.error("Failed to ensure output link column: %s", e)
+        return
+
+    # Ensure process column exists (optional control flag)
+    try:
+        ensure_process_column(sheets_svc, input_spreadsheet_id)
+    except Exception as e:
+        logger.error("Failed to ensure process column: %s", e)
+        return
+
+    # Ensure last-ran column exists (run timestamp per row)
+    try:
+        ensure_last_ran_column(sheets_svc, input_spreadsheet_id)
+    except Exception as e:
+        logger.error("Failed to ensure last ran column: %s", e)
         return
 
     # Update Spotify release dates before processing TikTok URLs.
@@ -2262,9 +2426,12 @@ def main():
         return
 
     # Filter out empty URLs for tqdm iteration
-    rows_to_process = [r for r in input_rows if r.get("audio_url")]
+    rows_to_process = [
+        r for r in input_rows
+        if r.get("audio_url") and r.get("process_enabled", True)
+    ]
     if len(rows_to_process) < len(input_rows):
-        logger.warning("Skipping %s row(s) with empty audio URL", len(input_rows) - len(rows_to_process))
+        logger.warning("Skipping %s row(s) due to empty URL or Process disabled", len(input_rows) - len(rows_to_process))
     if not rows_to_process:
         logger.warning("No rows to process")
         return
