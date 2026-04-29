@@ -33,6 +33,7 @@ import json
 import logging
 import time
 import sys
+import argparse
 import datetime as dt
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -92,8 +93,8 @@ PROFILE_DIR = resolve_profile_dir()
 # C: Spotify Audio URL (optional for non-original versions) |
 # D: Spotify Release Date (optional) |
 # E: Tiktok Audio URL | F: Output Link |
-# G: Process (whether to run the scraper for this row/version)
-# H: Last Ran (date when this row/version was last successfully processed)
+# G: Process Videos (whether to run the scraper for this row/version)
+# H: Last Run Videos (date when this row/version was last successfully processed)
 INPUT_COL_SONG_NAME = 0
 INPUT_COL_VERSION = 1
 INPUT_COL_SPOTIFY_AUDIO_URL = 2
@@ -106,8 +107,8 @@ INPUT_HEADER_SONG_NAME = "song name"
 INPUT_HEADER_VERSION = "version"
 INPUT_HEADER_TIKTOK_AUDIO_URLS = {"tiktok audio url", "tik tok audio url"}
 INPUT_HEADER_OUTPUT_LINK = "output link"
-INPUT_HEADER_PROCESS = "process"
-INPUT_HEADER_LAST_RAN = "last ran"
+INPUT_HEADER_PROCESS = "process videos"
+INPUT_HEADER_LAST_RAN = "last run videos"
 DEFAULT_SONG_VERSION = "original"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
@@ -655,13 +656,13 @@ def _ensure_process_column_impl(sheets_svc, spreadsheet_id: str) -> None:
         headers = result.get("values", [[]])[0] if result.get("values") else []
         process_col_label = _column_index_to_a1_label(INPUT_COL_PROCESS)
 
-        # Ensure Process is at configured process column.
+        # Ensure Process Videos is at configured process column.
         while len(headers) <= INPUT_COL_PROCESS:
             headers.append("")
 
         current = str(headers[INPUT_COL_PROCESS]).strip()
         if current.lower() != INPUT_HEADER_PROCESS:
-            headers[INPUT_COL_PROCESS] = "Process"
+            headers[INPUT_COL_PROCESS] = "Process Videos"
             sheets_svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range="1:1",
@@ -669,9 +670,9 @@ def _ensure_process_column_impl(sheets_svc, spreadsheet_id: str) -> None:
                 body={"values": [headers]},
             ).execute()
 
-            logger.info("Set 'Process' header in column %s", process_col_label)
+            logger.info("Set 'Process Videos' header in column %s", process_col_label)
         else:
-            logger.info("'Process' header already exists in column %s", process_col_label)
+            logger.info("'Process Videos' header already exists in column %s", process_col_label)
 
     except HttpError as e:
         logger.error("Error ensuring process column: %s", e)
@@ -679,7 +680,7 @@ def _ensure_process_column_impl(sheets_svc, spreadsheet_id: str) -> None:
 
 
 def ensure_last_ran_column(sheets_svc, spreadsheet_id: str) -> None:
-    """Ensure header row has 'Last Ran' in the configured last-ran column."""
+    """Ensure header row has 'Last Run Videos' in the configured last-ran column."""
     _ensure_last_ran_column_impl(sheets_svc, spreadsheet_id)
 
 
@@ -694,13 +695,13 @@ def _ensure_last_ran_column_impl(sheets_svc, spreadsheet_id: str) -> None:
         headers = result.get("values", [[]])[0] if result.get("values") else []
         last_ran_col_label = _column_index_to_a1_label(INPUT_COL_LAST_RAN)
 
-        # Ensure Last Ran is at configured last-ran column.
+        # Ensure Last Run Videos is at configured last-ran column.
         while len(headers) <= INPUT_COL_LAST_RAN:
             headers.append("")
 
         current = str(headers[INPUT_COL_LAST_RAN]).strip()
         if current.lower() != INPUT_HEADER_LAST_RAN:
-            headers[INPUT_COL_LAST_RAN] = "Last Ran"
+            headers[INPUT_COL_LAST_RAN] = "Last Run Videos"
             sheets_svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range="1:1",
@@ -708,9 +709,9 @@ def _ensure_last_ran_column_impl(sheets_svc, spreadsheet_id: str) -> None:
                 body={"values": [headers]},
             ).execute()
 
-            logger.info("Set 'Last Ran' header in column %s", last_ran_col_label)
+            logger.info("Set 'Last Run Videos' header in column %s", last_ran_col_label)
         else:
-            logger.info("'Last Ran' header already exists in column %s", last_ran_col_label)
+            logger.info("'Last Run Videos' header already exists in column %s", last_ran_col_label)
 
     except HttpError as e:
         logger.error("Error ensuring last ran column: %s", e)
@@ -1361,7 +1362,7 @@ def _postprocess_output_sheet_impl(sheets_svc, spreadsheet_id: str) -> int:
     return len(row_indices_0_based)
 
 
-_OUTPUT_LINK_QUEUE: List[Tuple[str, int, str, str]] = []  # (spreadsheet_id, row_index, output_url, last_ran_date)
+_OUTPUT_LINK_QUEUE: List[Tuple[str, int, str, str, str]] = []  # (spreadsheet_id, row_index, output_url, last_ran_date, process_value)
 _OUTPUT_LINK_BATCH_SIZE = 5
 
 
@@ -1371,19 +1372,21 @@ def _flush_output_link_queue(sheets_svc) -> None:
     if not _OUTPUT_LINK_QUEUE:
         return
     # Group by spreadsheet_id (typically one input sheet for entire run)
-    by_sheet: Dict[str, List[Tuple[int, str, str]]] = {}
-    for sid, row_index, output_url, last_ran_date in _OUTPUT_LINK_QUEUE:
-        by_sheet.setdefault(sid, []).append((row_index, output_url, last_ran_date))
+    by_sheet: Dict[str, List[Tuple[int, str, str, str]]] = {}
+    for sid, row_index, output_url, last_ran_date, process_value in _OUTPUT_LINK_QUEUE:
+        by_sheet.setdefault(sid, []).append((row_index, output_url, last_ran_date, process_value))
     _OUTPUT_LINK_QUEUE = []
     output_col_label = _column_index_to_a1_label(INPUT_COL_OUTPUT_LINK)
     last_ran_col_label = _column_index_to_a1_label(INPUT_COL_LAST_RAN)
+    process_col_label = _column_index_to_a1_label(INPUT_COL_PROCESS)
     for spreadsheet_id, updates in by_sheet.items():
         try:
-            # Write output link + last-ran date in one batchUpdate call.
+            # Write output link + last-ran date + process value in one batchUpdate call.
             data = []
-            for row_index, output_url, last_ran_date in updates:
+            for row_index, output_url, last_ran_date, process_value in updates:
                 data.append({"range": f"{output_col_label}{row_index}", "values": [[output_url]]})
                 data.append({"range": f"{last_ran_col_label}{row_index}", "values": [[last_ran_date]]})
+                data.append({"range": f"{process_col_label}{row_index}", "values": [[process_value]]})
             sheets_svc.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": data}
@@ -1399,10 +1402,11 @@ def queue_output_link(
     row_index: int,
     output_url: str,
     last_ran_date: str,
+    process_value: str,
     force_flush: bool = False
 ) -> None:
     """Queue output link write; flush when batch size reached or force_flush."""
-    _OUTPUT_LINK_QUEUE.append((spreadsheet_id, row_index, output_url, last_ran_date))
+    _OUTPUT_LINK_QUEUE.append((spreadsheet_id, row_index, output_url, last_ran_date, process_value))
     if len(_OUTPUT_LINK_QUEUE) >= _OUTPUT_LINK_BATCH_SIZE or force_flush:
         _flush_output_link_queue(sheets_svc)
 
@@ -1413,7 +1417,7 @@ def write_output_link_back(
     row_index: int,
     output_url: str
 ) -> None:
-    """Write output_url and stamp 'Last Ran' (today) for the row_index. Uses queue for batching."""
+    """Write output_url, stamp 'Last Ran', and set Process=skip for successful rows."""
     last_ran_date = dt.datetime.now(CAIRO_TZ).date().isoformat()
     queue_output_link(
         sheets_svc,
@@ -1421,6 +1425,7 @@ def write_output_link_back(
         row_index,
         output_url,
         last_ran_date=last_ran_date,
+        process_value="skip",
         force_flush=False,
     )
 
@@ -2332,7 +2337,19 @@ def _format_elapsed(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape TikTok audio videos into Google Sheets."
+    )
+    parser.add_argument(
+        "--run-all-songs",
+        action="store_true",
+        help="Run all rows with audio URLs, ignoring the Process column.",
+    )
+    return parser.parse_args()
+
+
+def main(run_all_songs: bool = False):
     """Main execution function."""
     log_ts = dt.datetime.now(CAIRO_TZ).strftime("%Y%m%d_%H%M%S")
     log_path = LOGS_DIR / f"tiktok_scrape_{log_ts}.log"
@@ -2428,10 +2445,14 @@ def main():
     # Filter out empty URLs for tqdm iteration
     rows_to_process = [
         r for r in input_rows
-        if r.get("audio_url") and r.get("process_enabled", True)
+        if r.get("audio_url") and (run_all_songs or r.get("process_enabled", True))
     ]
     if len(rows_to_process) < len(input_rows):
-        logger.warning("Skipping %s row(s) due to empty URL or Process disabled", len(input_rows) - len(rows_to_process))
+        logger.warning(
+            "Skipping %s row(s) due to empty URL%s",
+            len(input_rows) - len(rows_to_process),
+            "" if run_all_songs else " or Process disabled",
+        )
     if not rows_to_process:
         logger.warning("No rows to process")
         return
@@ -2621,4 +2642,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(run_all_songs=args.run_all_songs)
